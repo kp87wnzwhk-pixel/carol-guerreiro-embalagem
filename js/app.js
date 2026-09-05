@@ -2300,7 +2300,7 @@ async function boot() {
         updateToastShown = true;
         toast('Atualizando app…', '', 3500);
       };
-      const reg = await navigator.serviceWorker.register('./sw.js?v=15');
+      const reg = await navigator.serviceWorker.register('./sw.js?v=18');
       if (navigator.serviceWorker.controller) {
         navigator.serviceWorker.controller.postMessage({ type: 'SKIP_WAITING' });
       }

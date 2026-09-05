@@ -12,13 +12,44 @@
   <link rel="manifest" href="manifest.json" />
   <link rel="icon" type="image/svg+xml" href="icons/logo.svg" />
   <link rel="apple-touch-icon" href="icons/apple-touch-icon.png" />
-  <link rel="stylesheet" href="css/styles.css?v=17" />
+  <link rel="stylesheet" href="css/styles.css?v=18" />
 </head>
 <body>
   <div id="app">
     <p class="empty-state">Carregando…</p>
   </div>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
-  <script type="module" src="js/app.js?v=17"></script>
+  <script>
+  // Se o módulo travar, não ficar eterno em Carregando…
+  setTimeout(function () {
+    var app = document.getElementById('app');
+    if (!app) return;
+    if (app.querySelector('.empty-state') && /Carregando/.test(app.textContent || '')) {
+      app.innerHTML = '<div class="screen" style="padding:24px;font-family:system-ui">'
+        + '<h1 style="color:#c2185b">Carol Embalagem</h1>'
+        + '<p>A página demorou a carregar (cache antigo).</p>'
+        + '<p><button id="btn-hard-reload" style="font-size:18px;padding:12px 18px;background:#e91e8c;color:#fff;border:0;border-radius:10px">Recarregar limpo</button></p>'
+        + '</div>';
+      document.getElementById('btn-hard-reload').onclick = function () {
+        if (navigator.serviceWorker) {
+          navigator.serviceWorker.getRegistrations().then(function (regs) {
+            return Promise.all(regs.map(function (r) { return r.unregister(); }));
+          }).then(function () {
+            if (window.caches) {
+              return caches.keys().then(function (keys) {
+                return Promise.all(keys.map(function (k) { return caches.delete(k); }));
+              });
+            }
+          }).finally(function () {
+            location.href = './?v=18&nocache=' + Date.now();
+          });
+        } else {
+          location.href = './?v=18&nocache=' + Date.now();
+        }
+      };
+    }
+  }, 6000);
+</script>
+  <script type="module" src="js/app.js?v=18"></script>
 </body>
 </html>
