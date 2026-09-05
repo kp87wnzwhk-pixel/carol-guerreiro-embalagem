@@ -1,7 +1,8 @@
 /**
  * Persistência local de registros de embalagem (localStorage).
+ * Dual-write + espelho + histórico de auto-backups para durabilidade.
  */
-import { STORAGE_KEYS } from './config.js';
+import { STORAGE_KEYS, AUTO_BACKUP_MAX } from './config.js';
 
 export function phoneDigits(phone) {
   return String(phone || '').replace(/\D/g, '');
@@ -88,22 +89,268 @@ export function normalizeRecord(raw) {
   };
 }
 
-export function loadRecords() {
+/** @returns {{ ok: true, records: object[] } | { ok: false, reason: 'missing'|'corrupt' }} */
+function tryParseRecordsKey(key) {
+  let raw;
   try {
-    const raw = localStorage.getItem(STORAGE_KEYS.records);
+    raw = localStorage.getItem(key);
+  } catch {
+    return { ok: false, reason: 'corrupt' };
+  }
+  if (raw == null || raw === '') return { ok: false, reason: 'missing' };
+  try {
+    const arr = JSON.parse(raw);
+    if (!Array.isArray(arr)) return { ok: false, reason: 'corrupt' };
+    return { ok: true, records: arr.map(normalizeRecord).filter(Boolean) };
+  } catch {
+    return { ok: false, reason: 'corrupt' };
+  }
+}
+
+function setLastSaveAt(iso) {
+  try {
+    localStorage.setItem(STORAGE_KEYS.lastSaveAt, iso || new Date().toISOString());
+  } catch (_) {}
+}
+
+export function getLastSaveAt() {
+  try {
+    return localStorage.getItem(STORAGE_KEYS.lastSaveAt) || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Carrega registros. Se primary faltar/corromper, restaura de mirror ou
+ * último auto-backup e marca banner one-time de recuperação.
+ */
+export function loadRecords() {
+  const primary = tryParseRecordsKey(STORAGE_KEYS.records);
+  if (primary.ok) return primary.records;
+
+  const mirror = tryParseRecordsKey(STORAGE_KEYS.recordsMirror);
+  if (mirror.ok && mirror.records.length >= 0) {
+    // Restore even if empty array is valid — but only if primary was missing/corrupt.
+    // Prefer non-empty sources when available.
+    const backups = listAutoBackups();
+    const latest = backups[0];
+    let source = mirror.records;
+    let from = 'mirror';
+    if (
+      latest &&
+      Array.isArray(latest.data) &&
+      latest.data.length > mirror.records.length
+    ) {
+      source = latest.data.map(normalizeRecord).filter(Boolean);
+      from = 'auto-backup';
+    }
+    try {
+      saveRecords(source);
+    } catch (_) {
+      /* best-effort restore write */
+    }
+    markRecoveryBanner(from);
+    return source;
+  }
+
+  const backups = listAutoBackups();
+  if (backups.length && Array.isArray(backups[0].data)) {
+    const source = backups[0].data.map(normalizeRecord).filter(Boolean);
+    try {
+      saveRecords(source);
+    } catch (_) {}
+    markRecoveryBanner('auto-backup');
+    return source;
+  }
+
+  return [];
+}
+
+function markRecoveryBanner(from) {
+  try {
+    sessionStorage.setItem(
+      STORAGE_KEYS.recoveryBanner,
+      JSON.stringify({ show: true, from, at: new Date().toISOString() })
+    );
+  } catch (_) {}
+}
+
+/** Consome e limpa o banner one-time de recuperação. */
+export function consumeRecoveryBanner() {
+  try {
+    const raw = sessionStorage.getItem(STORAGE_KEYS.recoveryBanner);
+    if (!raw) return null;
+    sessionStorage.removeItem(STORAGE_KEYS.recoveryBanner);
+    const parsed = JSON.parse(raw);
+    if (parsed && parsed.show) return parsed;
+  } catch (_) {}
+  return null;
+}
+
+export function peekRecoveryBanner() {
+  try {
+    const raw = sessionStorage.getItem(STORAGE_KEYS.recoveryBanner);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (parsed && parsed.show) return parsed;
+  } catch (_) {}
+  return null;
+}
+
+export function clearRecoveryBanner() {
+  try {
+    sessionStorage.removeItem(STORAGE_KEYS.recoveryBanner);
+  } catch (_) {}
+}
+
+/**
+ * Dual-write: primary + mirror. Atualiza lastSaveAt.
+ */
+export function saveRecords(records) {
+  const cleaned = (records || []).map(normalizeRecord).filter(Boolean);
+  const json = JSON.stringify(cleaned);
+  localStorage.setItem(STORAGE_KEYS.records, json);
+  try {
+    localStorage.setItem(STORAGE_KEYS.recordsMirror, json);
+  } catch (err) {
+    console.warn('Falha ao gravar espelho:', err);
+  }
+  setLastSaveAt(new Date().toISOString());
+  return cleaned;
+}
+
+function readAutoBackupsRaw() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEYS.autoBackups);
     if (!raw) return [];
     const arr = JSON.parse(raw);
     if (!Array.isArray(arr)) return [];
-    return arr.map(normalizeRecord).filter(Boolean);
+    return arr;
   } catch {
     return [];
   }
 }
 
-export function saveRecords(records) {
+function writeAutoBackupsRaw(list) {
+  localStorage.setItem(STORAGE_KEYS.autoBackups, JSON.stringify(list));
+}
+
+/**
+ * Lista auto-backups (mais recentes primeiro).
+ * Formato: { id, at, count, data }
+ */
+export function listAutoBackups() {
+  return readAutoBackupsRaw()
+    .filter((b) => b && b.id && Array.isArray(b.data))
+    .slice()
+    .sort((a, b) => String(b.at).localeCompare(String(a.at)));
+}
+
+export function getLastAutoBackupAt() {
+  const list = listAutoBackups();
+  return list[0]?.at || null;
+}
+
+/**
+ * Grava snapshot silencioso. Mantém no máximo AUTO_BACKUP_MAX.
+ * Em QuotaExceededError, remove os mais antigos e tenta de novo.
+ * @returns {{ n: number, id: string, at: string } | null}
+ */
+export function pushAutoBackup(records) {
   const cleaned = (records || []).map(normalizeRecord).filter(Boolean);
-  localStorage.setItem(STORAGE_KEYS.records, JSON.stringify(cleaned));
-  return cleaned;
+  const snapshot = {
+    id: crypto.randomUUID(),
+    at: new Date().toISOString(),
+    count: cleaned.length,
+    data: cleaned,
+  };
+
+  let list = readAutoBackupsRaw()
+    .filter((b) => b && b.id)
+    .sort((a, b) => String(b.at).localeCompare(String(a.at)));
+
+  list.unshift(snapshot);
+  if (list.length > AUTO_BACKUP_MAX) {
+    list = list.slice(0, AUTO_BACKUP_MAX);
+  }
+
+  const tryWrite = (candidate) => {
+    writeAutoBackupsRaw(candidate);
+  };
+
+  try {
+    tryWrite(list);
+  } catch (err) {
+    const isQuota =
+      err &&
+      (err.name === 'QuotaExceededError' ||
+        err.code === 22 ||
+        err.code === 1014);
+    if (!isQuota) {
+      console.warn('Auto-backup falhou:', err);
+      return null;
+    }
+    // Drop oldest until it fits (or list shrinks to just the new snapshot)
+    let shrinking = list.slice();
+    while (shrinking.length > 1) {
+      shrinking.pop();
+      try {
+        tryWrite(shrinking);
+        list = shrinking;
+        break;
+      } catch (e2) {
+        if (shrinking.length <= 1) {
+          console.warn('Auto-backup: quota mesmo com 1 snapshot', e2);
+          return null;
+        }
+      }
+    }
+    if (shrinking.length === 1) {
+      try {
+        tryWrite(shrinking);
+        list = shrinking;
+      } catch (e3) {
+        console.warn('Auto-backup: impossível gravar', e3);
+        return null;
+      }
+    }
+  }
+
+  // Número sequencial aproximado = total históricos já vistos + posição
+  // Usamos o tamanho da lista após insert como #N (1 = mais antigo deste ciclo,
+  // mas o requisito pede “Backup automático #N” — usamos contagem acumulada
+  // via índice invertido: o mais recente é o #list.length neste ciclo de caps,
+  // melhor: número global crescente baseado em quantos já existiam.
+  const n = list.length; // within cap window; UI shows this as #N
+  // Prefer a monotonic counter stored alongside
+  let seq = 0;
+  try {
+    const prev = Number(localStorage.getItem('cgi_pack_auto_backup_seq') || '0');
+    seq = prev + 1;
+    localStorage.setItem('cgi_pack_auto_backup_seq', String(seq));
+  } catch {
+    seq = list.length;
+  }
+
+  return { n: seq, id: snapshot.id, at: snapshot.at };
+}
+
+export function restoreFromAutoBackup(backupId) {
+  const list = listAutoBackups();
+  const found = list.find((b) => b.id === backupId);
+  if (!found || !Array.isArray(found.data)) return null;
+  return saveRecords(found.data);
+}
+
+export function getDurabilityStatus(records) {
+  const count = Array.isArray(records) ? records.length : loadRecords().length;
+  return {
+    count,
+    lastSaveAt: getLastSaveAt(),
+    lastAutoBackupAt: getLastAutoBackupAt(),
+    autoBackupCount: listAutoBackups().length,
+  };
 }
 
 export function searchRecords(records, query) {
@@ -135,6 +382,28 @@ export function formatDateBR(iso) {
   } catch {
     return '—';
   }
+}
+
+export function formatTimeHM(iso) {
+  try {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return '—';
+    return d.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+  } catch {
+    return '—';
+  }
+}
+
+/** Nome de ficheiro: carol-embalagem-backup-YYYY-MM-DD-HHmm.json */
+export function backupFilename(date = new Date()) {
+  const d = date instanceof Date ? date : new Date(date);
+  const pad = (n) => String(n).padStart(2, '0');
+  const y = d.getFullYear();
+  const m = pad(d.getMonth() + 1);
+  const day = pad(d.getDate());
+  const hh = pad(d.getHours());
+  const mm = pad(d.getMinutes());
+  return `carol-embalagem-backup-${y}-${m}-${day}-${hh}${mm}.json`;
 }
 
 export function getEffectivePin(defaultPin) {

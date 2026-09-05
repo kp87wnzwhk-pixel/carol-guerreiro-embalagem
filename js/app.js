@@ -14,6 +14,7 @@ import {
   formatWeight,
   formatMeasures,
   formatDateBR,
+  formatTimeHM,
   normalizeRecord,
   getEffectivePin,
   setPinOverride,
@@ -21,6 +22,14 @@ import {
   setSessionUnlocked,
   getSavedNickname,
   setSavedNickname,
+  pushAutoBackup,
+  listAutoBackups,
+  restoreFromAutoBackup,
+  getDurabilityStatus,
+  getLastSaveAt,
+  peekRecoveryBanner,
+  clearRecoveryBanner,
+  backupFilename,
 } from './storage.js';
 import {
   addPhoto,
@@ -49,6 +58,7 @@ let currentView = 'pin'; // pin | home | form | detail | settings | backup
 let editingId = null;
 let detailId = null;
 let searchQuery = '';
+let recoveryBanner = null; // one-time after boot recovery
 
 const $ = (sel, el = document) => el.querySelector(sel);
 const $$ = (sel, el = document) => [...el.querySelectorAll(sel)];
@@ -73,7 +83,7 @@ function getRecord(id) {
   return records.find((r) => r.id === id) || null;
 }
 
-function toast(msg, type = '') {
+function toast(msg, type = '', ms = 3200) {
   const el = $('#toast');
   if (!el) return;
   el.textContent = msg;
@@ -81,7 +91,7 @@ function toast(msg, type = '') {
   clearTimeout(toast._t);
   toast._t = setTimeout(() => {
     el.classList.remove('show');
-  }, 2800);
+  }, ms);
 }
 
 function downloadBlob(filename, blob) {
@@ -91,6 +101,41 @@ function downloadBlob(filename, blob) {
   a.download = filename;
   a.click();
   setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+/** Metadata-only backup (small) — records + photoCount, sem fotos base64. */
+function buildMetadataPayload() {
+  return {
+    app: 'carol-guerreiro-embalagem',
+    kind: 'metadata',
+    exportedAt: new Date().toISOString(),
+    recordCount: records.length,
+    records: records.map((r) => ({
+      ...r,
+      photoCount: Number(r.photoCount) || 0,
+    })),
+  };
+}
+
+function downloadMetadataBackup() {
+  const payload = buildMetadataPayload();
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+  downloadBlob(backupFilename(new Date()), blob);
+}
+
+/**
+ * Após create/edit bem-sucedido:
+ * auto-backup silencioso + toast + download metadata JSON.
+ */
+function afterSuccessfulSave() {
+  const result = pushAutoBackup(records);
+  const n = result?.n ?? listAutoBackups().length;
+  try {
+    downloadMetadataBackup();
+  } catch (err) {
+    console.warn('Auto-download backup:', err);
+  }
+  toast(`Salvo no aparelho ✓ · Backup automático #${n}`, 'ok', 4000);
 }
 
 /* ---------- PIN ---------- */
@@ -188,8 +233,15 @@ function headerHtml(opts = {}) {
         ${showSettings ? `<button type="button" class="btn-icon" id="btn-settings" aria-label="Configurações">⚙</button>` : '<span class="header-spacer"></span>'}
       </div>
       ${opts.subtitle ? `<p class="screen-subtitle">${opts.subtitle}</p>` : ''}
+      ${opts.statusLine ? `<p class="durability-status" id="home-save-status">${opts.statusLine}</p>` : ''}
     </header>
   `;
+}
+
+function homeStatusLine() {
+  const last = getLastSaveAt();
+  const hm = last ? formatTimeHM(last) : '—';
+  return `${records.length} caixa${records.length === 1 ? '' : 's'} · último save ${hm}`;
 }
 
 /* ---------- PIN screen ---------- */
@@ -258,9 +310,21 @@ function renderHome() {
     `).join('')
     : `<p class="empty-state">${searchQuery ? 'Nenhuma caixa encontrada.' : 'Nenhuma caixa embalada ainda. Toque em “Nova caixa”.'}</p>`;
 
+  const banner = recoveryBanner
+    ? `<div class="recovery-banner" role="status" id="recovery-banner">
+        Dados recuperados do backup automático
+        <button type="button" class="banner-dismiss" id="btn-dismiss-recovery" aria-label="Fechar">✕</button>
+      </div>`
+    : '';
+
   return `
     <div class="screen home-screen">
-      ${headerHtml({ showSettings: true, subtitle: 'Registro de embalagem' })}
+      ${headerHtml({
+        showSettings: true,
+        subtitle: 'Registro de embalagem',
+        statusLine: escapeHtml(homeStatusLine()),
+      })}
+      ${banner}
       <p class="sync-badge ${sync.mode}">${escapeHtml(sync.message)}</p>
       <section class="card search-block">
         <label for="search-input" class="card-title">Buscar — nome ou telefone</label>
@@ -295,10 +359,19 @@ function bindHome() {
     currentView = 'backup';
     render();
   });
+  $('#btn-dismiss-recovery')?.addEventListener('click', () => {
+    recoveryBanner = null;
+    clearRecoveryBanner();
+    const el = $('#recovery-banner');
+    if (el) el.remove();
+  });
+  // One-time: clear session flag after first home paint with banner
+  if (recoveryBanner) {
+    clearRecoveryBanner();
+  }
   const search = $('#search-input');
   search?.addEventListener('input', () => {
     searchQuery = search.value;
-    // Re-render list only to avoid scroll jump / focus loss
     const list = searchRecords(records, searchQuery);
     const host = $('#record-list');
     if (!host) return;
@@ -469,7 +542,6 @@ async function refreshPhotoPreview() {
   const host = $('#photo-preview');
   if (!host) return;
   let html = '';
-  // Existing saved photos (edit mode)
   if (editingId) {
     try {
       const photos = await listPhotosForRecord(editingId);
@@ -572,7 +644,6 @@ async function saveForm() {
     records.push(rec);
   }
 
-  // Persist new photos
   for (const blob of pendingPhotoBlobs) {
     const photoId = await addPhoto(rec.id, blob);
     try {
@@ -594,7 +665,7 @@ async function saveForm() {
     console.warn('Sync upsert:', e);
   }
 
-  toast('Caixa salva');
+  afterSuccessfulSave();
   detailId = rec.id;
   editingId = null;
   currentView = 'detail';
@@ -767,21 +838,59 @@ function bindSettings() {
 
 /* ---------- Backup ---------- */
 function renderBackup() {
+  const st = getDurabilityStatus(records);
+  const backups = listAutoBackups();
+  const backupItems = backups.length
+    ? backups
+        .map(
+          (b) => `
+      <li class="auto-backup-item">
+        <div class="auto-backup-meta">
+          <strong>${escapeHtml(formatDateBR(b.at))}</strong>
+          <span class="muted">${b.count} caixa(s)</span>
+        </div>
+        <button type="button" class="btn btn-outline btn-sm" data-restore="${escapeAttr(b.id)}">Restaurar</button>
+      </li>`
+        )
+        .join('')
+    : '<p class="hint">Nenhum auto-backup ainda. Salve uma caixa para criar.</p>';
+
   return `
     <div class="screen backup-screen">
       ${headerHtml({ showBack: true, compact: true, title: 'Backup' })}
+      <section class="card status-card">
+        <h2 class="card-title">Estado neste aparelho</h2>
+        <ul class="status-list">
+          <li><span>Caixas</span><strong>${st.count}</strong></li>
+          <li><span>Último save</span><strong>${escapeHtml(st.lastSaveAt ? formatDateBR(st.lastSaveAt) : '—')}</strong></li>
+          <li><span>Último auto-backup</span><strong>${escapeHtml(st.lastAutoBackupAt ? formatDateBR(st.lastAutoBackupAt) : '—')}</strong></li>
+        </ul>
+        <p class="hint warn-text">Apagar dados do site no Safari (ou limpar cache) apaga o localStorage. Guarde os JSON baixados em Arquivos / iCloud.</p>
+      </section>
       <section class="card">
-        <h2 class="card-title">Exportar JSON</h2>
-        <p class="hint">Exporta os metadados das caixas. Fotos pequenas entram em base64 (best-effort); se o arquivo ficar grande demais, as fotos permanecem só neste aparelho.</p>
-        <label class="check-row">
-          <input type="checkbox" id="exp-photos" checked />
-          Incluir fotos (se caber)
-        </label>
-        <button type="button" class="btn btn-primary btn-lg btn-block" id="btn-export">Baixar backup</button>
+        <h2 class="card-title">Download obrigatório</h2>
+        <p class="hint">Baixa só metadados (leve, com photoCount). Guarde o ficheiro fora do navegador.</p>
+        <button type="button" class="btn btn-success btn-lg btn-block" id="btn-download-now">
+          Baixar backup agora (obrigatório guardar)
+        </button>
+      </section>
+      <section class="card">
+        <h2 class="card-title">Backup completo com fotos</h2>
+        <p class="hint warn-text">Pode ficar muito grande (fotos em base64). Use só quando precisar de cópia completa.</p>
+        <button type="button" class="btn btn-secondary btn-lg btn-block" id="btn-full-photos">
+          Backup completo com fotos
+        </button>
+      </section>
+      <section class="card">
+        <h2 class="card-title">Auto-backups neste aparelho</h2>
+        <p class="hint">Últimos ${backups.length} de até 30 snapshots no localStorage.</p>
+        <ul class="auto-backup-list" id="auto-backup-list">
+          ${backupItems}
+        </ul>
       </section>
       <section class="card">
         <h2 class="card-title">Importar JSON</h2>
-        <p class="hint">Mescla registros pelo id (atualiza se o importado for mais recente).</p>
+        <p class="hint">Mescla registros pelo id (atualiza se o importado for mais recente). Pedirá confirmação.</p>
         <label class="btn btn-secondary btn-lg btn-block file-btn">
           Escolher arquivo…
           <input type="file" id="import-file" accept="application/json,.json" hidden />
@@ -796,17 +905,51 @@ function bindBackup() {
     currentView = 'home';
     render();
   });
-  $('#btn-export')?.addEventListener('click', () => doExport());
+  $('#btn-download-now')?.addEventListener('click', () => {
+    downloadMetadataBackup();
+    toast('Backup (metadados) baixado — guarde em Arquivos/iCloud', 'ok', 4000);
+  });
+  $('#btn-full-photos')?.addEventListener('click', () => {
+    if (
+      !confirm(
+        'Backup completo inclui fotos em base64 e pode ficar MUITO grande (vários MB). Continuar?'
+      )
+    ) {
+      return;
+    }
+    doExportFull();
+  });
   $('#import-file')?.addEventListener('change', (e) => doImport(e));
+  $$('[data-restore]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const id = btn.dataset.restore;
+      if (
+        !confirm(
+          'Restaurar este auto-backup? Os dados atuais neste aparelho serão substituídos pelos do snapshot.'
+        )
+      ) {
+        return;
+      }
+      const restored = restoreFromAutoBackup(id);
+      if (!restored) {
+        toast('Falha ao restaurar', 'err');
+        return;
+      }
+      records = restored;
+      toast('Restaurado do auto-backup', 'ok');
+      currentView = 'home';
+      render();
+    });
+  });
 }
 
-async function doExport() {
-  let includePhotos = !!$('#exp-photos')?.checked;
-  const MAX_PHOTO_BYTES = 1_200_000; // ~1.2MB por foto no JSON
-  const MAX_TOTAL = 8_000_000;
+async function doExportFull() {
+  const MAX_PHOTO_BYTES = 1_200_000;
+  const MAX_TOTAL = 12_000_000;
   let totalEst = 0;
   const photosNote = [];
   const outRecords = [];
+  let includePhotos = true;
 
   for (const r of records) {
     const copy = { ...r, photos: [] };
@@ -816,16 +959,25 @@ async function doExport() {
         for (const p of photos) {
           if (!p.blob) continue;
           if (p.blob.size > MAX_PHOTO_BYTES) {
-            photosNote.push(`Foto grande omitida em ${r.clientName} (${Math.round(p.blob.size / 1024)} KB)`);
+            photosNote.push(
+              `Foto grande omitida em ${r.clientName} (${Math.round(p.blob.size / 1024)} KB)`
+            );
             continue;
           }
           if (totalEst + p.blob.size > MAX_TOTAL) {
-            photosNote.push('Limite de tamanho do JSON atingido — demais fotos ficam no aparelho.');
+            photosNote.push(
+              'Limite de tamanho do JSON atingido — demais fotos ficam no aparelho.'
+            );
             includePhotos = false;
             break;
           }
           const dataUrl = await blobToDataURL(p.blob);
-          copy.photos.push({ id: p.id, mime: p.mime, createdAt: p.createdAt, dataUrl });
+          copy.photos.push({
+            id: p.id,
+            mime: p.mime,
+            createdAt: p.createdAt,
+            dataUrl,
+          });
           totalEst += p.blob.size;
         }
       } catch (_) {}
@@ -835,20 +987,35 @@ async function doExport() {
 
   const payload = {
     app: 'carol-guerreiro-embalagem',
+    kind: 'full-with-photos',
     exportedAt: new Date().toISOString(),
     records: outRecords,
     notes: photosNote,
   };
-  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
-  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
-  downloadBlob(`carol-embalagem-backup-${stamp}.json`, blob);
-  toast(photosNote.length ? 'Backup baixado (algumas fotos omitidas)' : 'Backup baixado');
+  const blob = new Blob([JSON.stringify(payload, null, 2)], {
+    type: 'application/json',
+  });
+  downloadBlob(backupFilename(new Date()), blob);
+  toast(
+    photosNote.length
+      ? 'Backup completo baixado (algumas fotos omitidas)'
+      : 'Backup completo baixado',
+    'ok',
+    4000
+  );
 }
 
 async function doImport(e) {
   const file = e.target.files?.[0];
   e.target.value = '';
   if (!file) return;
+  if (
+    !confirm(
+      `Importar “${file.name}”? Os registros serão mesclados por id (mais recentes vencem).`
+    )
+  ) {
+    return;
+  }
   try {
     const text = await file.text();
     const data = JSON.parse(text);
@@ -868,7 +1035,6 @@ async function doImport(e) {
         map.set(n.id, { ...local, ...n });
         updated++;
       }
-      // restore photos best-effort
       if (Array.isArray(raw.photos)) {
         for (const ph of raw.photos) {
           if (!ph?.dataUrl) continue;
@@ -884,7 +1050,8 @@ async function doImport(e) {
     }
     records = [...map.values()];
     persistLocal();
-    toast(`Importado: ${added} novo(s), ${updated} atualizado(s)`);
+    pushAutoBackup(records);
+    toast(`Importado: ${added} novo(s), ${updated} atualizado(s)`, 'ok');
     currentView = 'home';
     render();
   } catch (err) {
@@ -908,6 +1075,7 @@ function escapeAttr(s) {
 /* ---------- boot ---------- */
 async function boot() {
   records = loadRecords();
+  recoveryBanner = peekRecoveryBanner();
   await initSync();
   await maybePullRemote();
   render();

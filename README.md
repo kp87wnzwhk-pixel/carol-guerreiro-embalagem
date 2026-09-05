@@ -7,6 +7,7 @@ App **estático** (PWA mobile-first) para registrar caixas embaladas no armazém
 - Lista de caixas com busca por nome/telefone
 - Medidas (C × L × A em cm), peso (kg + g), fotos, observações
 - PIN da equipe (padrão temporário: **`2026`**)
+- Durabilidade local reforçada (espelho + auto-backups + download automático)
 - Backup JSON (exportar / importar)
 - Pronto para Firebase Firestore + Storage (desligado por padrão)
 
@@ -31,11 +32,46 @@ python3 -m http.server 8080
 
 Com `SYNC_ENABLED = false` em `js/firebase-config.js`:
 
-- Metadados das caixas → `localStorage`
+- Metadados das caixas → `localStorage` (chave principal + espelho)
+- Auto-backups → até 30 snapshots em `cgi_pack_auto_backups_v1`
 - Fotos → IndexedDB
 - Funciona offline em **um** aparelho
 
 A lista começa **vazia** (sem clientes inventados).
+
+### Limite honesto do Safari / iPhone
+
+**Apagar dados do site** (Safari → Definições → Avançadas / Dados de sites, ou “Limpar histórico e dados”) **apaga** `localStorage` e IndexedDB deste app. O espelho e os auto-backups **também somem** nesse caso — estão no mesmo armazenamento do navegador.
+
+Por isso o app:
+
+1. Grava em dual-write (`cgi_pack_records_v1` + `cgi_pack_records_mirror_v1`)
+2. Mantém histórico de auto-backups no aparelho
+3. **Baixa automaticamente um JSON leve** (só metadados / `photoCount`) a cada save — **guarde esse ficheiro em Arquivos / iCloud Drive**
+4. Oferece “Backup completo com fotos” (base64) quando precisar de cópia pesada
+
+**Você DEVE guardar os JSON descarregados fora do Safari.** Sem isso, limpar dados do site = perda dos registos locais.
+
+Para **vários aparelhos / nuvem**, configure Firebase (secção abaixo). O modo local sozinho **não** substitui sync multi-dispositivo.
+
+## Durabilidade e backups
+
+| Camada | O quê |
+|--------|--------|
+| Primary | `cgi_pack_records_v1` |
+| Mirror | `cgi_pack_records_mirror_v1` (mesmos dados) |
+| Auto-backups | `cgi_pack_auto_backups_v1` — últimos 30 `{ id, at, count, data }` |
+| Download automático | A cada create/edit: `carol-embalagem-backup-YYYY-MM-DD-HHmm.json` (metadados) |
+| Toast | “Salvo no aparelho ✓ · Backup automático #N” |
+| Arranque | Se primary faltar/corromper → restaura mirror ou último auto-backup + banner “Dados recuperados do backup automático” |
+
+Ecrã **Backup**:
+
+- Botão verde **Baixar backup agora (obrigatório guardar)**
+- Lista de auto-backups com **Restaurar** (confirmação)
+- **Backup completo com fotos** (aviso de tamanho)
+- Importar JSON (com confirmação)
+- Estado: último save, último auto-backup, contagem
 
 ## Sincronização multi-aparelho (Firebase)
 
@@ -89,10 +125,7 @@ service firebase.storage {
 3. Abra `https://<usuario>.github.io/<repo>/`
 4. No celular: **Adicionar à tela inicial** (PWA)
 
-## Backup
-
-- **Exportar JSON**: metadados + fotos pequenas em base64 (best-effort). Fotos grandes permanecem no aparelho.
-- **Importar JSON**: mescla por `id` (atualiza se o importado for mais recente).
+O service worker usa cache `cgi-pack-v2` — após deploy, feche e reabra o PWA (ou limpe só o cache do SW) para receber a atualização.
 
 ## Estrutura
 
@@ -100,13 +133,13 @@ service firebase.storage {
 index.html
 css/styles.css
 js/app.js
-js/config.js          ← TEAM_PIN
-js/storage.js
+js/config.js          ← TEAM_PIN + STORAGE_KEYS
+js/storage.js         ← dual-write, auto-backups, recovery
 js/db.js              ← IndexedDB fotos
 js/sync.js
 js/firebase-config.js ← SYNC_ENABLED + credenciais
 manifest.json
-sw.js
+sw.js                 ← cache cgi-pack-v2
 icons/
 README.md
 ```
