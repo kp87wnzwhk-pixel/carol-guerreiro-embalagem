@@ -10,7 +10,7 @@ App **estático** (PWA mobile-first) para registrar caixas embaladas no armazém
 - PIN da equipe (padrão temporário: **`2026`**)
 - Durabilidade local reforçada (espelho + auto-backups + download automático)
 - Backup JSON (exportar / importar)
-- Pronto para Firebase Firestore + Storage (desligado por padrão)
+- Sincronização multi-aparelho via Firebase Firestore + Storage (**ligada** neste deploy)
 
 ## Abrir localmente
 
@@ -29,9 +29,9 @@ python3 -m http.server 8080
 - Após o PIN correto, a sessão fica desbloqueada (`sessionStorage`) até fechar a aba
 - Em **Configurações** (ícone ⚙): alterar PIN (exige o PIN atual) ou bloquear de novo
 
-## Modo local (padrão)
+## Modo local (opcional)
 
-Com `SYNC_ENABLED = false` em `js/firebase-config.js`:
+Para forçar só um aparelho, defina `SYNC_ENABLED = false` em `js/firebase-config.js`:
 
 - Metadados das caixas → `localStorage` (chave principal + espelho)
 - Auto-backups → até 30 snapshots em `cgi_pack_auto_backups_v1`
@@ -76,22 +76,21 @@ Ecrã **Backup**:
 
 ## Sincronização multi-aparelho (Firebase)
 
-1. Crie um projeto gratuito em [Firebase Console](https://console.firebase.google.com)
-2. Ative **Firestore Database** (modo produção ou teste; ajuste as regras)
-3. Ative **Storage**
-4. Em Configurações do projeto → Seus apps → Web: copie o objeto `firebaseConfig`
-5. Cole em `js/firebase-config.js` e defina:
+Neste repositório a sync está **ativa** (`SYNC_ENABLED = true` + credenciais do projeto `carol-embalagem`).
 
-```js
-export const SYNC_ENABLED = true;
-```
+**Obrigatório no Console:** criar **Firestore Database** e **Storage** em **modo de teste** (test mode) se ainda não existirem. Sem isso o app local continua a funcionar, mas a nuvem falha (permissões / resource-not-found).
 
-6. Coleção Firestore: `embalagens`  
-   Fotos no Storage: `embalagens/{id}/…`
+1. Abra [Firebase Console](https://console.firebase.google.com) → projeto `carol-embalagem`
+2. Crie **Firestore Database** → escolha **start in test mode**
+3. Crie **Storage** → também em **test mode**
+4. Se o assistente já fechou o modo teste, cole as regras abertas abaixo
+5. Coleção Firestore: `embalagens` · fotos: `embalagens/{id}/…`
 
 ### Regras sugeridas (teste / equipe pequena)
 
-O app usa PIN no cliente — **não** substitui autenticação Firebase. Para produção, prefira Auth + regras por usuário. Em teste rápido (só equipe interna):
+⚠️ **Aviso de expiração:** regras `allow … if true` e o “test mode” do Firebase **expiram** (tipicamente após ~30 dias no assistente). Depois disso leituras/escritas falham até você renovar as regras ou migrar para Auth. Não use isto em produção pública.
+
+O app usa PIN no cliente — **não** substitui autenticação Firebase. Para produção, prefira Auth + regras por usuário. Em teste rápido (só equipe interna), cole:
 
 **Firestore**
 
@@ -137,7 +136,7 @@ Cada registro tem um campo `workDate` (`YYYY-MM-DD`, data local do aparelho) —
 3. Abra `https://<usuario>.github.io/<repo>/`
 4. No celular: **Adicionar à tela inicial** (PWA)
 
-O service worker usa cache `cgi-pack-v4` — após deploy, feche e reabra o PWA (ou limpe só o cache do SW) para receber a atualização.
+O service worker usa cache `cgi-pack-v5` — após deploy, feche e reabra o PWA (ou limpe só o cache do SW) para receber a atualização.
 
 ## Estrutura
 
@@ -151,7 +150,7 @@ js/db.js              ← IndexedDB fotos
 js/sync.js
 js/firebase-config.js ← SYNC_ENABLED + credenciais
 manifest.json
-sw.js                 ← cache cgi-pack-v4
+sw.js                 ← cache cgi-pack-v5
 icons/
 README.md
 ```

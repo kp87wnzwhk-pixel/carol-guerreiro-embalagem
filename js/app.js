@@ -55,6 +55,8 @@ import {
   syncPullAll,
   syncUploadPhoto,
   syncDeletePhoto,
+  syncListPhotoUrls,
+  subscribeRecords,
 } from './sync.js';
 
 let records = [];
@@ -163,25 +165,54 @@ function requireUnlock() {
 }
 
 /* ---------- Merge remote ---------- */
+function mergeRemoteIntoLocal(remote) {
+  if (!Array.isArray(remote)) return false;
+  const map = new Map(records.map((r) => [r.id, r]));
+  let changed = false;
+  for (const r of remote) {
+    const n = normalizeRecord(r);
+    if (!n) continue;
+    const local = map.get(n.id);
+    if (!local || String(n.updatedAt) > String(local.updatedAt)) {
+      map.set(n.id, n);
+      changed = true;
+    }
+  }
+  if (changed) {
+    records = [...map.values()];
+    persistLocal();
+  }
+  return changed;
+}
+
 async function maybePullRemote() {
   if (!isSyncActive()) return;
   try {
     const remote = await syncPullAll();
     if (!remote) return;
-    const map = new Map(records.map((r) => [r.id, r]));
-    for (const r of remote) {
-      const n = normalizeRecord(r);
-      if (!n) continue;
-      const local = map.get(n.id);
-      if (!local || String(n.updatedAt) > String(local.updatedAt)) {
-        map.set(n.id, n);
-      }
-    }
-    records = [...map.values()];
-    persistLocal();
+    mergeRemoteIntoLocal(remote);
   } catch (err) {
     console.warn('Pull remoto falhou:', err);
   }
+}
+
+let unsubRecords = null;
+
+function startRealtimeSync() {
+  if (unsubRecords) {
+    try { unsubRecords(); } catch (_) {}
+    unsubRecords = null;
+  }
+  if (!isSyncActive()) return;
+  unsubRecords = subscribeRecords((remote) => {
+    const changed = mergeRemoteIntoLocal(remote);
+    if (!changed) return;
+    // Não interromper formulário no meio da edição
+    if (currentView === 'form') return;
+    if (currentView === 'home' || currentView === 'detail') {
+      render();
+    }
+  });
 }
 
 /* ---------- Render shell ---------- */
@@ -365,6 +396,10 @@ function renderGroupedListHtml(list) {
 function renderHome() {
   const list = filteredHomeRecords();
   const sync = getSyncStatus();
+  const syncLabel =
+    sync.mode === 'sync'
+      ? 'Nuvem ligada · todos os celulares veem a mesma lista'
+      : sync.message;
   const items = renderGroupedListHtml(list);
 
   const banner = recoveryBanner
@@ -385,7 +420,7 @@ function renderHome() {
         statusLine: escapeHtml(homeStatusLine()),
       })}
       ${banner}
-      <p class="sync-badge ${sync.mode}">${escapeHtml(sync.message)}</p>
+      <p class="sync-badge ${sync.mode}">${escapeHtml(syncLabel)}</p>
       <section class="card search-block">
         <label for="search-input" class="card-title">Buscar — nome ou telefone</label>
         <input type="search" id="search-input" placeholder="Ex: Maria, (21) 9…"
@@ -894,16 +929,29 @@ async function loadDetailPhotos(recordId) {
   if (!host) return;
   try {
     const photos = await listPhotosForRecord(recordId);
-    if (!photos.length) {
-      host.innerHTML = '<p class="hint">Sem fotos.</p>';
+    if (photos.length) {
+      host.innerHTML = photos
+        .map((p) => {
+          const url = trackUrl(photoObjectURL(p));
+          return `<a class="gallery-item" href="${url}" target="_blank" rel="noopener"><img src="${url}" alt="Foto da caixa" /></a>`;
+        })
+        .join('');
       return;
     }
-    host.innerHTML = photos
-      .map((p) => {
-        const url = trackUrl(photoObjectURL(p));
-        return `<a class="gallery-item" href="${url}" target="_blank" rel="noopener"><img src="${url}" alt="Foto da caixa" /></a>`;
-      })
-      .join('');
+    // Outro aparelho: fotos só no Storage — listar URLs remotas
+    if (isSyncActive()) {
+      const urls = await syncListPhotoUrls(recordId);
+      if (urls.length) {
+        host.innerHTML = urls
+          .map(
+            (url) =>
+              `<a class="gallery-item" href="${escapeAttr(url)}" target="_blank" rel="noopener"><img src="${escapeAttr(url)}" alt="Foto da caixa" /></a>`
+          )
+          .join('');
+        return;
+      }
+    }
+    host.innerHTML = '<p class="hint">Sem fotos.</p>';
   } catch {
     host.innerHTML = '<p class="hint err">Erro ao carregar fotos.</p>';
   }
@@ -1227,6 +1275,7 @@ async function boot() {
   recoveryBanner = peekRecoveryBanner();
   await initSync();
   await maybePullRemote();
+  startRealtimeSync();
   render();
 
   if ('serviceWorker' in navigator) {

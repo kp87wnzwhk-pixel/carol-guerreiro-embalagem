@@ -7,16 +7,19 @@
  * 3. Cole as credenciais abaixo (firebaseConfig)
  * 4. Defina SYNC_ENABLED = true
  * 5. Regras sugeridas no README (com PIN no app, não no Firebase)
+ *
+ * Não inicialize Analytics neste app estático.
  */
-export const SYNC_ENABLED = false;
+export const SYNC_ENABLED = true;
 
 export const firebaseConfig = {
-  apiKey: 'YOUR_API_KEY',
-  authDomain: 'YOUR_PROJECT.firebaseapp.com',
-  projectId: 'YOUR_PROJECT_ID',
-  storageBucket: 'YOUR_PROJECT.appspot.com',
-  messagingSenderId: 'YOUR_SENDER_ID',
-  appId: 'YOUR_APP_ID',
+  apiKey: 'AIzaSyD_MZWaKejOAwclw_4YC6rJd--5hoC4o24',
+  authDomain: 'carol-embalagem.firebaseapp.com',
+  projectId: 'carol-embalagem',
+  storageBucket: 'carol-embalagem.firebasestorage.app',
+  messagingSenderId: '215450406714',
+  appId: '1:215450406714:web:2385a61bcd942fc47a8a03',
+  measurementId: 'G-HSF638QS2N',
 };
 
 /** Coleção Firestore e caminho no Storage */

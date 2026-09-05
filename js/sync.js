@@ -78,6 +78,44 @@ export async function syncPullAll() {
   return list;
 }
 
+
+/**
+ * Escuta em tempo real a coleção embalagens.
+ * onChange(recordsArray) a cada snapshot; retorna unsubscribe (no-op se sync inativo).
+ */
+export function subscribeRecords(onChange) {
+  if (!isSyncActive()) {
+    return () => {};
+  }
+  let unsub = () => {};
+  let cancelled = false;
+  (async () => {
+    try {
+      const { collection, onSnapshot } = await import(
+        'https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js'
+      );
+      if (cancelled) return;
+      unsub = onSnapshot(
+        collection(db, FIRESTORE_COLLECTION),
+        (snap) => {
+          const list = [];
+          snap.forEach((d) => list.push({ id: d.id, ...d.data() }));
+          onChange(list);
+        },
+        (err) => {
+          console.warn('subscribeRecords:', err);
+        }
+      );
+    } catch (err) {
+      console.warn('subscribeRecords init:', err);
+    }
+  })();
+  return () => {
+    cancelled = true;
+    unsub();
+  };
+}
+
 /** Envia foto para Storage: embalagens/{recordId}/{photoId} */
 export async function syncUploadPhoto(recordId, photoId, blob) {
   if (!isSyncActive() || !recordId || !photoId || !blob) return null;
