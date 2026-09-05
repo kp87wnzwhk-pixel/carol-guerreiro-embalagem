@@ -1,0 +1,924 @@
+/**
+ * Carol Guerreiro Importado — Embalagem (PWA mobile-first)
+ */
+import { TEAM_PIN, APP_NAME, SLOGAN } from './config.js';
+import {
+  loadRecords,
+  saveRecords,
+  searchRecords,
+  formatPhoneBR,
+  phoneDigits,
+  waLink,
+  weightToGrams,
+  gramsToKgG,
+  formatWeight,
+  formatMeasures,
+  formatDateBR,
+  normalizeRecord,
+  getEffectivePin,
+  setPinOverride,
+  isSessionUnlocked,
+  setSessionUnlocked,
+  getSavedNickname,
+  setSavedNickname,
+} from './storage.js';
+import {
+  addPhoto,
+  listPhotosForRecord,
+  deletePhoto,
+  deleteAllPhotosForRecord,
+  photoObjectURL,
+  blobToDataURL,
+  dataURLToBlob,
+} from './db.js';
+import {
+  initSync,
+  isSyncActive,
+  getSyncStatus,
+  syncUpsertRecord,
+  syncDeleteRecord,
+  syncPullAll,
+  syncUploadPhoto,
+  syncDeletePhoto,
+} from './sync.js';
+
+let records = [];
+let objectUrls = [];
+let pendingPhotoBlobs = []; // blobs ainda não gravados (formulário novo)
+let currentView = 'pin'; // pin | home | form | detail | settings | backup
+let editingId = null;
+let detailId = null;
+let searchQuery = '';
+
+const $ = (sel, el = document) => el.querySelector(sel);
+const $$ = (sel, el = document) => [...el.querySelectorAll(sel)];
+
+function revokeUrls() {
+  for (const u of objectUrls) {
+    try { URL.revokeObjectURL(u); } catch (_) {}
+  }
+  objectUrls = [];
+}
+
+function trackUrl(u) {
+  objectUrls.push(u);
+  return u;
+}
+
+function persistLocal() {
+  records = saveRecords(records);
+}
+
+function getRecord(id) {
+  return records.find((r) => r.id === id) || null;
+}
+
+function toast(msg, type = '') {
+  const el = $('#toast');
+  if (!el) return;
+  el.textContent = msg;
+  el.className = 'toast show' + (type ? ' ' + type : '');
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => {
+    el.classList.remove('show');
+  }, 2800);
+}
+
+function downloadBlob(filename, blob) {
+  const a = document.createElement('a');
+  const url = URL.createObjectURL(blob);
+  a.href = url;
+  a.download = filename;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+/* ---------- PIN ---------- */
+function tryUnlock(pinInput) {
+  const effective = getEffectivePin(TEAM_PIN);
+  if (String(pinInput) === String(effective)) {
+    setSessionUnlocked(true);
+    return true;
+  }
+  return false;
+}
+
+function requireUnlock() {
+  if (isSessionUnlocked()) return true;
+  currentView = 'pin';
+  render();
+  return false;
+}
+
+/* ---------- Merge remote ---------- */
+async function maybePullRemote() {
+  if (!isSyncActive()) return;
+  try {
+    const remote = await syncPullAll();
+    if (!remote) return;
+    const map = new Map(records.map((r) => [r.id, r]));
+    for (const r of remote) {
+      const n = normalizeRecord(r);
+      if (!n) continue;
+      const local = map.get(n.id);
+      if (!local || String(n.updatedAt) > String(local.updatedAt)) {
+        map.set(n.id, n);
+      }
+    }
+    records = [...map.values()];
+    persistLocal();
+  } catch (err) {
+    console.warn('Pull remoto falhou:', err);
+  }
+}
+
+/* ---------- Render shell ---------- */
+function render() {
+  revokeUrls();
+  const root = $('#app');
+  if (!root) return;
+
+  if (!isSessionUnlocked()) {
+    currentView = 'pin';
+    root.innerHTML = renderPin();
+    bindPin();
+    return;
+  }
+
+  switch (currentView) {
+    case 'form':
+      root.innerHTML = renderForm();
+      bindForm();
+      break;
+    case 'detail':
+      root.innerHTML = renderDetailShell();
+      bindDetail();
+      break;
+    case 'settings':
+      root.innerHTML = renderSettings();
+      bindSettings();
+      break;
+    case 'backup':
+      root.innerHTML = renderBackup();
+      bindBackup();
+      break;
+    default:
+      currentView = 'home';
+      root.innerHTML = renderHome();
+      bindHome();
+      break;
+  }
+}
+
+function headerHtml(opts = {}) {
+  const { showBack = false, title = null, showSettings = false } = opts;
+  return `
+    <header class="app-header ${opts.compact ? 'compact' : ''}">
+      <div class="header-bar">
+        ${showBack ? `<button type="button" class="btn-icon" id="btn-back" aria-label="Voltar">←</button>` : '<span class="header-spacer"></span>'}
+        <div class="header-center">
+          ${!opts.compact ? `
+            <div class="logo-wrap" aria-hidden="true">
+              <img src="icons/logo.svg" alt="" class="logo" width="64" height="64" />
+            </div>
+            <h1 class="brand">${APP_NAME}</h1>
+            <p class="slogan">${SLOGAN}</p>
+          ` : `<h1 class="brand brand-sm">${title || 'Embalagem'}</h1>`}
+        </div>
+        ${showSettings ? `<button type="button" class="btn-icon" id="btn-settings" aria-label="Configurações">⚙</button>` : '<span class="header-spacer"></span>'}
+      </div>
+      ${opts.subtitle ? `<p class="screen-subtitle">${opts.subtitle}</p>` : ''}
+    </header>
+  `;
+}
+
+/* ---------- PIN screen ---------- */
+function renderPin() {
+  return `
+    <div class="screen pin-screen">
+      ${headerHtml({})}
+      <section class="card pin-card">
+        <h2 class="card-title">Acesso da equipe</h2>
+        <p class="hint">Digite o PIN para abrir o registro de embalagens.</p>
+        <div class="form-row">
+          <label for="pin-input">PIN</label>
+          <input type="password" id="pin-input" inputmode="numeric" autocomplete="one-time-code"
+            maxlength="12" placeholder="••••" />
+        </div>
+        <p class="hint err" id="pin-error" hidden></p>
+        <button type="button" class="btn btn-primary btn-lg btn-block" id="btn-unlock">Entrar</button>
+      </section>
+    </div>
+  `;
+}
+
+function bindPin() {
+  const input = $('#pin-input');
+  const err = $('#pin-error');
+  const go = () => {
+    const v = (input?.value || '').trim();
+    if (!v) {
+      err.hidden = false;
+      err.textContent = 'Informe o PIN.';
+      return;
+    }
+    if (tryUnlock(v)) {
+      err.hidden = true;
+      currentView = 'home';
+      render();
+      return;
+    }
+    if (input) input.value = '';
+    err.hidden = false;
+    err.textContent = 'PIN incorreto. Sem acesso aos dados.';
+    input?.focus();
+  };
+  $('#btn-unlock')?.addEventListener('click', go);
+  input?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      go();
+    }
+  });
+  setTimeout(() => input?.focus(), 50);
+}
+
+/* ---------- Home ---------- */
+function renderHome() {
+  const list = searchRecords(records, searchQuery);
+  const sync = getSyncStatus();
+  const items = list.length
+    ? list.map((r) => `
+      <button type="button" class="list-item" data-id="${r.id}">
+        <strong>${escapeHtml(r.clientName || 'Sem nome')}</strong>
+        <span class="list-meta">${escapeHtml(r.phone || '')}</span>
+        <span class="list-meta">${escapeHtml(formatMeasures(r))} · ${escapeHtml(formatWeight(r.weightGrams))}</span>
+        <span class="list-meta muted">${escapeHtml(formatDateBR(r.createdAt))}</span>
+      </button>
+    `).join('')
+    : `<p class="empty-state">${searchQuery ? 'Nenhuma caixa encontrada.' : 'Nenhuma caixa embalada ainda. Toque em “Nova caixa”.'}</p>`;
+
+  return `
+    <div class="screen home-screen">
+      ${headerHtml({ showSettings: true, subtitle: 'Registro de embalagem' })}
+      <p class="sync-badge ${sync.mode}">${escapeHtml(sync.message)}</p>
+      <section class="card search-block">
+        <label for="search-input" class="card-title">Buscar — nome ou telefone</label>
+        <input type="search" id="search-input" placeholder="Ex: Maria, (21) 9…"
+          value="${escapeAttr(searchQuery)}" autocomplete="off" />
+      </section>
+      <section class="list-section" id="record-list" aria-live="polite">
+        ${items}
+      </section>
+      <div class="fab-spacer"></div>
+      <button type="button" class="fab" id="btn-nova" aria-label="Nova caixa">＋ Nova caixa</button>
+      <footer class="app-footer">
+        <button type="button" class="btn btn-outline btn-sm" id="btn-goto-backup">Backup</button>
+        <span>${records.length} caixa(s)</span>
+      </footer>
+    </div>
+  `;
+}
+
+function bindHome() {
+  $('#btn-settings')?.addEventListener('click', () => {
+    currentView = 'settings';
+    render();
+  });
+  $('#btn-nova')?.addEventListener('click', () => {
+    editingId = null;
+    pendingPhotoBlobs = [];
+    currentView = 'form';
+    render();
+  });
+  $('#btn-goto-backup')?.addEventListener('click', () => {
+    currentView = 'backup';
+    render();
+  });
+  const search = $('#search-input');
+  search?.addEventListener('input', () => {
+    searchQuery = search.value;
+    // Re-render list only to avoid scroll jump / focus loss
+    const list = searchRecords(records, searchQuery);
+    const host = $('#record-list');
+    if (!host) return;
+    host.innerHTML = list.length
+      ? list.map((r) => `
+        <button type="button" class="list-item" data-id="${r.id}">
+          <strong>${escapeHtml(r.clientName || 'Sem nome')}</strong>
+          <span class="list-meta">${escapeHtml(r.phone || '')}</span>
+          <span class="list-meta">${escapeHtml(formatMeasures(r))} · ${escapeHtml(formatWeight(r.weightGrams))}</span>
+          <span class="list-meta muted">${escapeHtml(formatDateBR(r.createdAt))}</span>
+        </button>
+      `).join('')
+      : `<p class="empty-state">${searchQuery ? 'Nenhuma caixa encontrada.' : 'Nenhuma caixa embalada ainda.'}</p>`;
+    bindListClicks();
+  });
+  bindListClicks();
+}
+
+function bindListClicks() {
+  $$('.list-item').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      detailId = btn.dataset.id;
+      currentView = 'detail';
+      render();
+    });
+  });
+}
+
+/* ---------- Form ---------- */
+function renderForm() {
+  const r = editingId ? getRecord(editingId) : null;
+  const { kg, g } = r ? gramsToKgG(r.weightGrams) : { kg: 0, g: 0 };
+  const nick = r?.createdBy || getSavedNickname();
+  return `
+    <div class="screen form-screen">
+      ${headerHtml({ showBack: true, compact: true, title: r ? 'Editar caixa' : 'Nova caixa' })}
+      <form class="card form-card" id="pack-form" novalidate>
+        <div class="form-row">
+          <label for="f-name">Nome do cliente <span class="required">*</span></label>
+          <input type="text" id="f-name" required autocomplete="name"
+            value="${escapeAttr(r?.clientName || '')}" placeholder="Nome completo" />
+        </div>
+        <div class="form-row">
+          <label for="f-phone">Telefone <span class="required">*</span></label>
+          <input type="tel" id="f-phone" inputmode="tel" required autocomplete="tel"
+            placeholder="(21) 99999-0000" value="${escapeAttr(r?.phone || '')}" />
+        </div>
+        <fieldset class="measure-fieldset">
+          <legend>Medidas da caixa (cm)</legend>
+          <div class="measure-grid">
+            <div class="form-row">
+              <label for="f-l">Comprimento</label>
+              <input type="number" id="f-l" inputmode="decimal" min="0" step="0.1"
+                value="${r ? escapeAttr(String(r.measureL)) : ''}" placeholder="cm" />
+            </div>
+            <div class="form-row">
+              <label for="f-w">Largura</label>
+              <input type="number" id="f-w" inputmode="decimal" min="0" step="0.1"
+                value="${r ? escapeAttr(String(r.measureW)) : ''}" placeholder="cm" />
+            </div>
+            <div class="form-row">
+              <label for="f-h">Altura</label>
+              <input type="number" id="f-h" inputmode="decimal" min="0" step="0.1"
+                value="${r ? escapeAttr(String(r.measureH)) : ''}" placeholder="cm" />
+            </div>
+          </div>
+        </fieldset>
+        <fieldset class="weight-fieldset">
+          <legend>Peso</legend>
+          <div class="weight-grid">
+            <div class="form-row">
+              <label for="f-kg">Quilos (kg)</label>
+              <input type="number" id="f-kg" inputmode="numeric" min="0" step="1"
+                value="${escapeAttr(String(kg))}" />
+            </div>
+            <div class="form-row">
+              <label for="f-g">Gramas (0–999)</label>
+              <input type="number" id="f-g" inputmode="numeric" min="0" max="999" step="1"
+                value="${escapeAttr(String(g))}" />
+            </div>
+          </div>
+        </fieldset>
+        <div class="form-row">
+          <label for="f-notes">Observações <span class="optional">(opcional)</span></label>
+          <textarea id="f-notes" rows="3" placeholder="Notas…">${escapeHtml(r?.notes || '')}</textarea>
+        </div>
+        <div class="form-row">
+          <label for="f-by">Quem registrou <span class="optional">(apelido)</span></label>
+          <input type="text" id="f-by" value="${escapeAttr(nick)}" placeholder="Seu nome / apelido" />
+        </div>
+        <div class="form-row">
+          <span class="card-title" style="margin-bottom:8px;display:block">Fotos</span>
+          <div class="btn-row photo-actions">
+            <label class="btn btn-secondary btn-lg file-btn">
+              📷 Câmera
+              <input type="file" id="f-camera" accept="image/*" capture="environment" hidden multiple />
+            </label>
+            <label class="btn btn-outline btn-lg file-btn">
+              🖼 Galeria
+              <input type="file" id="f-gallery" accept="image/*" hidden multiple />
+            </label>
+          </div>
+          <div class="photo-preview" id="photo-preview"></div>
+        </div>
+        <p class="hint err" id="form-error" hidden></p>
+        <div class="btn-row">
+          <button type="button" class="btn btn-secondary btn-lg" id="btn-cancel-form">Cancelar</button>
+          <button type="submit" class="btn btn-primary btn-lg" id="btn-save">Salvar</button>
+        </div>
+      </form>
+    </div>
+  `;
+}
+
+async function bindForm() {
+  $('#btn-back')?.addEventListener('click', () => {
+    pendingPhotoBlobs = [];
+    if (editingId) {
+      detailId = editingId;
+      currentView = 'detail';
+    } else {
+      currentView = 'home';
+    }
+    render();
+  });
+  $('#btn-cancel-form')?.addEventListener('click', () => {
+    $('#btn-back')?.click();
+  });
+
+  const phone = $('#f-phone');
+  phone?.addEventListener('input', () => {
+    const pos = phone.selectionStart;
+    const before = phone.value.length;
+    phone.value = formatPhoneBR(phone.value);
+    const after = phone.value.length;
+    try { phone.setSelectionRange(pos + (after - before), pos + (after - before)); } catch (_) {}
+  });
+
+  const gInput = $('#f-g');
+  gInput?.addEventListener('input', () => {
+    let v = Math.floor(Number(gInput.value) || 0);
+    if (v > 999) gInput.value = '999';
+    if (v < 0) gInput.value = '0';
+  });
+
+  $('#f-camera')?.addEventListener('change', (e) => onPhotosPicked(e));
+  $('#f-gallery')?.addEventListener('change', (e) => onPhotosPicked(e));
+
+  await refreshPhotoPreview();
+
+  $('#pack-form')?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    await saveForm();
+  });
+}
+
+async function onPhotosPicked(e) {
+  const files = [...(e.target.files || [])];
+  e.target.value = '';
+  for (const f of files) {
+    if (!f.type.startsWith('image/')) continue;
+    pendingPhotoBlobs.push(f);
+  }
+  await refreshPhotoPreview();
+}
+
+async function refreshPhotoPreview() {
+  const host = $('#photo-preview');
+  if (!host) return;
+  let html = '';
+  // Existing saved photos (edit mode)
+  if (editingId) {
+    try {
+      const photos = await listPhotosForRecord(editingId);
+      for (const p of photos) {
+        const url = trackUrl(photoObjectURL(p));
+        html += `
+          <div class="thumb" data-saved="${p.id}">
+            <img src="${url}" alt="Foto" />
+            <button type="button" class="thumb-del" data-del-saved="${p.id}" aria-label="Remover">✕</button>
+          </div>`;
+      }
+    } catch (_) {}
+  }
+  pendingPhotoBlobs.forEach((blob, i) => {
+    const url = trackUrl(URL.createObjectURL(blob));
+    html += `
+      <div class="thumb" data-pending="${i}">
+        <img src="${url}" alt="Nova foto" />
+        <button type="button" class="thumb-del" data-del-pending="${i}" aria-label="Remover">✕</button>
+      </div>`;
+  });
+  host.innerHTML = html || '<p class="hint">Nenhuma foto ainda.</p>';
+  $$('[data-del-saved]', host).forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const id = btn.dataset.delSaved;
+      await deletePhoto(id);
+      try { await syncDeletePhoto(editingId, id); } catch (_) {}
+      await refreshPhotoPreview();
+      toast('Foto removida');
+    });
+  });
+  $$('[data-del-pending]', host).forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const i = Number(btn.dataset.delPending);
+      pendingPhotoBlobs.splice(i, 1);
+      await refreshPhotoPreview();
+    });
+  });
+}
+
+async function saveForm() {
+  const err = $('#form-error');
+  const name = ($('#f-name')?.value || '').trim();
+  const phoneRaw = ($('#f-phone')?.value || '').trim();
+  const digits = phoneDigits(phoneRaw);
+  if (!name) {
+    err.hidden = false;
+    err.textContent = 'Informe o nome do cliente.';
+    $('#f-name')?.focus();
+    return;
+  }
+  if (digits.length < 10) {
+    err.hidden = false;
+    err.textContent = 'Telefone inválido. Use o formato (21) 99999-0000.';
+    $('#f-phone')?.focus();
+    return;
+  }
+  err.hidden = true;
+
+  const measureL = Number($('#f-l')?.value) || 0;
+  const measureW = Number($('#f-w')?.value) || 0;
+  const measureH = Number($('#f-h')?.value) || 0;
+  const kg = Number($('#f-kg')?.value) || 0;
+  const g = Math.min(999, Math.max(0, Math.floor(Number($('#f-g')?.value) || 0)));
+  const notes = ($('#f-notes')?.value || '').trim();
+  const createdBy = ($('#f-by')?.value || '').trim();
+  setSavedNickname(createdBy);
+
+  const now = new Date().toISOString();
+  let rec;
+  if (editingId) {
+    const existing = getRecord(editingId);
+    rec = normalizeRecord({
+      ...existing,
+      clientName: name,
+      phone: formatPhoneBR(phoneRaw),
+      measureL,
+      measureW,
+      measureH,
+      weightGrams: weightToGrams(kg, g),
+      notes,
+      createdBy,
+      updatedAt: now,
+    });
+    records = records.map((r) => (r.id === editingId ? rec : r));
+  } else {
+    rec = normalizeRecord({
+      id: crypto.randomUUID(),
+      clientName: name,
+      phone: formatPhoneBR(phoneRaw),
+      measureL,
+      measureW,
+      measureH,
+      weightGrams: weightToGrams(kg, g),
+      notes,
+      createdBy,
+      createdAt: now,
+      updatedAt: now,
+    });
+    records.push(rec);
+  }
+
+  // Persist new photos
+  for (const blob of pendingPhotoBlobs) {
+    const photoId = await addPhoto(rec.id, blob);
+    try {
+      if (isSyncActive()) await syncUploadPhoto(rec.id, photoId, blob);
+    } catch (e) {
+      console.warn('Upload foto:', e);
+    }
+  }
+  pendingPhotoBlobs = [];
+
+  const photos = await listPhotosForRecord(rec.id);
+  rec.photoCount = photos.length;
+  records = records.map((r) => (r.id === rec.id ? rec : r));
+  persistLocal();
+
+  try {
+    if (isSyncActive()) await syncUpsertRecord(rec);
+  } catch (e) {
+    console.warn('Sync upsert:', e);
+  }
+
+  toast('Caixa salva');
+  detailId = rec.id;
+  editingId = null;
+  currentView = 'detail';
+  render();
+}
+
+/* ---------- Detail ---------- */
+function renderDetailShell() {
+  const r = getRecord(detailId);
+  if (!r) {
+    return `
+      <div class="screen">
+        ${headerHtml({ showBack: true, compact: true, title: 'Detalhe' })}
+        <p class="empty-state">Registro não encontrado.</p>
+      </div>`;
+  }
+  return `
+    <div class="screen detail-screen">
+      ${headerHtml({ showBack: true, compact: true, title: 'Detalhe da caixa' })}
+      <section class="card detail-card">
+        <h2 class="detail-name">${escapeHtml(r.clientName)}</h2>
+        <p class="detail-phone">${escapeHtml(r.phone)}</p>
+        <dl class="detail-dl">
+          <div><dt>Medidas</dt><dd>${escapeHtml(formatMeasures(r))}</dd></div>
+          <div><dt>Peso</dt><dd>${escapeHtml(formatWeight(r.weightGrams))}</dd></div>
+          <div><dt>Criado em</dt><dd>${escapeHtml(formatDateBR(r.createdAt))}</dd></div>
+          <div><dt>Atualizado</dt><dd>${escapeHtml(formatDateBR(r.updatedAt))}</dd></div>
+          ${r.createdBy ? `<div><dt>Por</dt><dd>${escapeHtml(r.createdBy)}</dd></div>` : ''}
+          ${r.notes ? `<div class="full"><dt>Observações</dt><dd>${escapeHtml(r.notes)}</dd></div>` : ''}
+        </dl>
+        <div class="photo-gallery" id="detail-photos"><p class="hint">Carregando fotos…</p></div>
+        <div class="btn-row stacked">
+          <a class="btn btn-whatsapp btn-lg btn-block" id="btn-wa" target="_blank" rel="noopener"
+            href="${escapeAttr(waLink(r.phone, r.clientName))}">WhatsApp</a>
+          <button type="button" class="btn btn-primary btn-lg btn-block" id="btn-edit">Editar</button>
+          <button type="button" class="btn btn-danger btn-lg btn-block" id="btn-delete">Excluir</button>
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+function bindDetail() {
+  $('#btn-back')?.addEventListener('click', () => {
+    currentView = 'home';
+    render();
+  });
+  const r = getRecord(detailId);
+  if (!r) return;
+
+  $('#btn-edit')?.addEventListener('click', () => {
+    editingId = r.id;
+    pendingPhotoBlobs = [];
+    currentView = 'form';
+    render();
+  });
+
+  $('#btn-delete')?.addEventListener('click', async () => {
+    if (!confirm(`Excluir a caixa de ${r.clientName}? Esta ação não pode ser desfeita.`)) return;
+    await deleteAllPhotosForRecord(r.id);
+    records = records.filter((x) => x.id !== r.id);
+    persistLocal();
+    try {
+      if (isSyncActive()) await syncDeleteRecord(r.id);
+    } catch (_) {}
+    toast('Caixa excluída');
+    detailId = null;
+    currentView = 'home';
+    render();
+  });
+
+  loadDetailPhotos(r.id);
+}
+
+async function loadDetailPhotos(recordId) {
+  const host = $('#detail-photos');
+  if (!host) return;
+  try {
+    const photos = await listPhotosForRecord(recordId);
+    if (!photos.length) {
+      host.innerHTML = '<p class="hint">Sem fotos.</p>';
+      return;
+    }
+    host.innerHTML = photos
+      .map((p) => {
+        const url = trackUrl(photoObjectURL(p));
+        return `<a class="gallery-item" href="${url}" target="_blank" rel="noopener"><img src="${url}" alt="Foto da caixa" /></a>`;
+      })
+      .join('');
+  } catch {
+    host.innerHTML = '<p class="hint err">Erro ao carregar fotos.</p>';
+  }
+}
+
+/* ---------- Settings ---------- */
+function renderSettings() {
+  const sync = getSyncStatus();
+  return `
+    <div class="screen settings-screen">
+      ${headerHtml({ showBack: true, compact: true, title: 'Configurações' })}
+      <section class="card">
+        <h2 class="card-title">Alterar PIN</h2>
+        <p class="hint">O PIN padrão está em <code>js/config.js</code> (TEAM_PIN). Você também pode gravar um PIN neste aparelho.</p>
+        <div class="form-row">
+          <label for="pin-current">PIN atual</label>
+          <input type="password" id="pin-current" inputmode="numeric" autocomplete="current-password" />
+        </div>
+        <div class="form-row">
+          <label for="pin-new">Novo PIN</label>
+          <input type="password" id="pin-new" inputmode="numeric" autocomplete="new-password" />
+        </div>
+        <div class="form-row">
+          <label for="pin-new2">Confirmar novo PIN</label>
+          <input type="password" id="pin-new2" inputmode="numeric" autocomplete="new-password" />
+        </div>
+        <p class="hint err" id="pin-change-err" hidden></p>
+        <button type="button" class="btn btn-primary btn-lg btn-block" id="btn-change-pin">Salvar novo PIN</button>
+      </section>
+      <section class="card">
+        <h2 class="card-title">Sincronização</h2>
+        <p class="hint">${escapeHtml(sync.message)}</p>
+        <p class="hint">Veja o README para configurar Firebase (Firestore + Storage).</p>
+      </section>
+      <section class="card">
+        <button type="button" class="btn btn-secondary btn-lg btn-block" id="btn-lock">Bloquear (pedir PIN)</button>
+      </section>
+    </div>
+  `;
+}
+
+function bindSettings() {
+  $('#btn-back')?.addEventListener('click', () => {
+    currentView = 'home';
+    render();
+  });
+  $('#btn-lock')?.addEventListener('click', () => {
+    setSessionUnlocked(false);
+    currentView = 'pin';
+    render();
+  });
+  $('#btn-change-pin')?.addEventListener('click', () => {
+    const err = $('#pin-change-err');
+    const cur = ($('#pin-current')?.value || '').trim();
+    const n1 = ($('#pin-new')?.value || '').trim();
+    const n2 = ($('#pin-new2')?.value || '').trim();
+    const effective = getEffectivePin(TEAM_PIN);
+    if (cur !== effective) {
+      err.hidden = false;
+      err.textContent = 'PIN atual incorreto.';
+      return;
+    }
+    if (n1.length < 4) {
+      err.hidden = false;
+      err.textContent = 'Novo PIN deve ter pelo menos 4 dígitos.';
+      return;
+    }
+    if (n1 !== n2) {
+      err.hidden = false;
+      err.textContent = 'A confirmação não confere.';
+      return;
+    }
+    setPinOverride(n1);
+    err.hidden = true;
+    toast('PIN atualizado neste aparelho');
+    $('#pin-current').value = '';
+    $('#pin-new').value = '';
+    $('#pin-new2').value = '';
+  });
+}
+
+/* ---------- Backup ---------- */
+function renderBackup() {
+  return `
+    <div class="screen backup-screen">
+      ${headerHtml({ showBack: true, compact: true, title: 'Backup' })}
+      <section class="card">
+        <h2 class="card-title">Exportar JSON</h2>
+        <p class="hint">Exporta os metadados das caixas. Fotos pequenas entram em base64 (best-effort); se o arquivo ficar grande demais, as fotos permanecem só neste aparelho.</p>
+        <label class="check-row">
+          <input type="checkbox" id="exp-photos" checked />
+          Incluir fotos (se caber)
+        </label>
+        <button type="button" class="btn btn-primary btn-lg btn-block" id="btn-export">Baixar backup</button>
+      </section>
+      <section class="card">
+        <h2 class="card-title">Importar JSON</h2>
+        <p class="hint">Mescla registros pelo id (atualiza se o importado for mais recente).</p>
+        <label class="btn btn-secondary btn-lg btn-block file-btn">
+          Escolher arquivo…
+          <input type="file" id="import-file" accept="application/json,.json" hidden />
+        </label>
+      </section>
+    </div>
+  `;
+}
+
+function bindBackup() {
+  $('#btn-back')?.addEventListener('click', () => {
+    currentView = 'home';
+    render();
+  });
+  $('#btn-export')?.addEventListener('click', () => doExport());
+  $('#import-file')?.addEventListener('change', (e) => doImport(e));
+}
+
+async function doExport() {
+  let includePhotos = !!$('#exp-photos')?.checked;
+  const MAX_PHOTO_BYTES = 1_200_000; // ~1.2MB por foto no JSON
+  const MAX_TOTAL = 8_000_000;
+  let totalEst = 0;
+  const photosNote = [];
+  const outRecords = [];
+
+  for (const r of records) {
+    const copy = { ...r, photos: [] };
+    if (includePhotos) {
+      try {
+        const photos = await listPhotosForRecord(r.id);
+        for (const p of photos) {
+          if (!p.blob) continue;
+          if (p.blob.size > MAX_PHOTO_BYTES) {
+            photosNote.push(`Foto grande omitida em ${r.clientName} (${Math.round(p.blob.size / 1024)} KB)`);
+            continue;
+          }
+          if (totalEst + p.blob.size > MAX_TOTAL) {
+            photosNote.push('Limite de tamanho do JSON atingido — demais fotos ficam no aparelho.');
+            includePhotos = false;
+            break;
+          }
+          const dataUrl = await blobToDataURL(p.blob);
+          copy.photos.push({ id: p.id, mime: p.mime, createdAt: p.createdAt, dataUrl });
+          totalEst += p.blob.size;
+        }
+      } catch (_) {}
+    }
+    outRecords.push(copy);
+  }
+
+  const payload = {
+    app: 'carol-guerreiro-embalagem',
+    exportedAt: new Date().toISOString(),
+    records: outRecords,
+    notes: photosNote,
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+  downloadBlob(`carol-embalagem-backup-${stamp}.json`, blob);
+  toast(photosNote.length ? 'Backup baixado (algumas fotos omitidas)' : 'Backup baixado');
+}
+
+async function doImport(e) {
+  const file = e.target.files?.[0];
+  e.target.value = '';
+  if (!file) return;
+  try {
+    const text = await file.text();
+    const data = JSON.parse(text);
+    const arr = Array.isArray(data) ? data : data.records;
+    if (!Array.isArray(arr)) throw new Error('JSON sem lista de records');
+    const map = new Map(records.map((r) => [r.id, r]));
+    let added = 0;
+    let updated = 0;
+    for (const raw of arr) {
+      const n = normalizeRecord(raw);
+      if (!n || !n.clientName) continue;
+      const local = map.get(n.id);
+      if (!local) {
+        map.set(n.id, n);
+        added++;
+      } else if (String(n.updatedAt) >= String(local.updatedAt)) {
+        map.set(n.id, { ...local, ...n });
+        updated++;
+      }
+      // restore photos best-effort
+      if (Array.isArray(raw.photos)) {
+        for (const ph of raw.photos) {
+          if (!ph?.dataUrl) continue;
+          try {
+            const blob = dataURLToBlob(ph.dataUrl);
+            await addPhoto(n.id, blob, { id: ph.id, createdAt: ph.createdAt });
+          } catch (_) {}
+        }
+      }
+      try {
+        if (isSyncActive()) await syncUpsertRecord(map.get(n.id));
+      } catch (_) {}
+    }
+    records = [...map.values()];
+    persistLocal();
+    toast(`Importado: ${added} novo(s), ${updated} atualizado(s)`);
+    currentView = 'home';
+    render();
+  } catch (err) {
+    alert('Falha ao importar: ' + (err.message || err));
+  }
+}
+
+/* ---------- helpers ---------- */
+function escapeHtml(s) {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function escapeAttr(s) {
+  return escapeHtml(s).replace(/'/g, '&#39;');
+}
+
+/* ---------- boot ---------- */
+async function boot() {
+  records = loadRecords();
+  await initSync();
+  await maybePullRemote();
+  render();
+
+  if ('serviceWorker' in navigator) {
+    try {
+      await navigator.serviceWorker.register('./sw.js');
+    } catch (err) {
+      console.warn('SW:', err);
+    }
+  }
+}
+
+boot();
