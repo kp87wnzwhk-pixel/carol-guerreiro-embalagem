@@ -67,6 +67,20 @@ let records = [];
 let objectUrls = [];
 let pendingPhotoBlobs = []; // blobs ainda não gravados (formulário novo)
 let currentView = 'pin'; // pin | home | form | detail | settings | backup
+
+const REGISTRARS = ['Ancião Carlos 👑', 'Aprendiz Guilherme', 'Jessica'];
+
+function normalizeCreatedBy(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return '';
+  if (REGISTRARS.includes(s)) return s;
+  const low = s.toLowerCase().normalize('NFD').replace(/\p{M}/gu, '');
+  if (low.includes('jessica') || low.includes('jéssica') || low === 'jessica') return 'Jessica';
+  if (low.includes('guilherme') || low.includes('aprendiz')) return 'Aprendiz Guilherme';
+  if (low.includes('carlos') || low.includes('mestre') || low.includes('anciao') || low.includes('ancião')) return 'Ancião Carlos 👑';
+  return '';
+}
+
 let editingId = null;
 let saveInProgress = false;
 let lastSaveStamp = 0; // debounce double-submit (ms)
@@ -823,7 +837,7 @@ function bindListClicks() {
 function renderForm() {
   const r = editingId ? getRecord(editingId) : null;
   const { kg, g } = r ? gramsToKgG(r.weightGrams) : { kg: 0, g: 0 };
-  const nick = r?.createdBy || getSavedNickname();
+  const nick = normalizeCreatedBy(r?.createdBy || getSavedNickname());
   return `
     <div class="screen form-screen">
       ${headerHtml({ showBack: true, compact: true, title: r ? 'Editar caixa' : 'Nova caixa' })}
@@ -885,9 +899,10 @@ function renderForm() {
         <div class="form-row">
           <label for="f-by">Quem registrou</label>
           <select id="f-by" required>
-            <option value="" disabled ${!nick ? 'selected' : ''}>Escolha quem registrou</option>
+            <option value="" disabled ${!['Ancião Carlos 👑','Aprendiz Guilherme','Jessica'].includes(nick) ? 'selected' : ''}>Escolha quem registrou</option>
+            <option value="Ancião Carlos 👑" ${nick === 'Ancião Carlos 👑' ? 'selected' : ''}>Ancião Carlos 👑</option>
             <option value="Aprendiz Guilherme" ${nick === 'Aprendiz Guilherme' ? 'selected' : ''}>Aprendiz Guilherme</option>
-            <option value="Mestre Carlos 👑" ${nick === 'Mestre Carlos 👑' || nick === 'Mestre Carlos' ? 'selected' : ''}>Mestre Carlos 👑</option>
+            <option value="Jessica" ${nick === 'Jessica' ? 'selected' : ''}>Jessica</option>
           </select>
         </div>
         <div class="form-row">
@@ -1069,7 +1084,13 @@ async function saveForm() {
     const kg = Number($('#f-kg')?.value) || 0;
     const g = Math.min(999, Math.max(0, Math.floor(Number($('#f-g')?.value) || 0)));
     const notes = ($('#f-notes')?.value || '').trim();
-    const createdBy = ($('#f-by')?.value || '').trim();
+    const createdBy = normalizeCreatedBy($('#f-by')?.value || '');
+    if (!createdBy) {
+      err.hidden = false;
+      err.textContent = 'Escolha quem registrou (Ancião Carlos, Aprendiz Guilherme ou Jessica).';
+      $('#f-by')?.focus();
+      return;
+    }
     setSavedNickname(createdBy);
     const workDate = workDateEarly;
 
@@ -1722,10 +1743,41 @@ function escapeAttr(s) {
 }
 
 /* ---------- boot ---------- */
+
+function migrateRegistrarNames() {
+  let changed = false;
+  records = records.map((r) => {
+    const next = normalizeCreatedBy(r.createdBy);
+    if (next && next !== r.createdBy) {
+      changed = true;
+      return { ...r, createdBy: next, updatedAt: new Date().toISOString() };
+    }
+    // clear unknown free-text to empty so UI forces pick on next edit? keep as-is mapped empty
+    if (r.createdBy && !next) {
+      changed = true;
+      return { ...r, createdBy: '', updatedAt: new Date().toISOString() };
+    }
+    return r;
+  });
+  if (changed) {
+    persistLocal();
+    // push fixed names to cloud (best-effort)
+    if (isSyncActive()) {
+      for (const r of records) {
+        if (!r?.id) continue;
+        syncUpsertRecord(r).catch(() => {});
+      }
+    }
+  }
+  const saved = normalizeCreatedBy(getSavedNickname());
+  if (saved) setSavedNickname(saved);
+}
+
 async function boot() {
   records = loadRecords();
   recoveryBanner = peekRecoveryBanner();
   await initSync();
+  migrateRegistrarNames();
   await maybePullRemote();
   startRealtimeSync();
   render();
