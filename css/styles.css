@@ -717,8 +717,78 @@ legend {
   font-weight: 700;
   margin: 0 0 8px;
 }
+
 .ocr-confirm-list {
   margin: 0 0 12px;
   padding-left: 1.1em;
   line-height: 1.5;
+}
+.ocr-confirm-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.ocr-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 0.9rem;
+}
+.ocr-field > span {
+  font-weight: 600;
+  color: var(--muted, #666);
+}
+.ocr-field input[type="text"],
+.ocr-field input[type="tel"],
+.ocr-field input[type="number"] {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px 10px;
+  border: 1px solid var(--border, #e5e5e5);
+  border-radius: 8px;
+  font-size: 1rem;
+  background: #fff;
+}
+.ocr-measures-row,
+.ocr-weight-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.ocr-measures-row input,
+.ocr-weight-row input {
+  flex: 1;
+  min-width: 0;
+}
+.ocr-x, .ocr-unit {
+  color: var(--muted, #888);
+  font-weight: 600;
+  flex: 0 0 auto;
+}
+.ocr-measures-combo,
+.ocr-weight-combo {
+  margin-top: 4px;
+  font-size: 0.9rem !important;
+}
+.ocr-raw {
+  margin: 0 0 12px;
+  font-size: 0.85rem;
+}
+.ocr-raw summary {
+  cursor: pointer;
+  color: var(--accent, #e91e8c);
+  font-weight: 600;
+}
+.ocr-raw-text {
+  margin: 8px 0 0;
+  padding: 8px;
+  max-height: 140px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: #fff;
+  border: 1px solid var(--border, #e5e5e5);
+  border-radius: 8px;
+  font-size: 0.8rem;
 }

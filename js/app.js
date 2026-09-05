@@ -69,7 +69,12 @@ import {
   syncPullExcludedIds,
   subscribeExcluded,
 } from './sync.js';
-import { recognize as recognizeLabel } from './ocr-fill.js';
+import {
+  recognize as recognizeLabel,
+  parseMeasures,
+  parseWeight,
+  NAME_SCORE_MIN,
+} from './ocr-fill.js';
 
 let records = [];
 let objectUrls = [];
@@ -1157,45 +1162,151 @@ function formatOcrWeight(parsed) {
 function showOcrConfirm(parsed) {
   const statusEl = $('#ocr-status');
   const confirmEl = $('#ocr-confirm');
+
+  const nameLow =
+    !parsed.name &&
+    (parsed.nameScore == null || parsed.nameScore < NAME_SCORE_MIN);
+  if (nameLow && parsed.nameRejected) {
+    toast('Nome não confiante — preencha na mão', 'err');
+  } else if (!parsed.name && parsed.nameScore != null && parsed.nameScore < NAME_SCORE_MIN) {
+    toast('Nome não confiante — preencha na mão', 'err');
+  }
+
+  const hasAny =
+    parsed.name ||
+    parsed.phone ||
+    parsed.l != null ||
+    parsed.w != null ||
+    parsed.h != null ||
+    parsed.kg != null ||
+    parsed.g != null ||
+    (parsed.rawText && String(parsed.rawText).trim());
+
   if (statusEl) {
-    const hasAny =
-      parsed.name ||
-      parsed.l != null ||
-      parsed.w != null ||
-      parsed.h != null ||
-      parsed.kg != null ||
-      parsed.g != null;
     if (!hasAny) {
       statusEl.hidden = true;
       toast('OCR não encontrou dados. Preencha manualmente.', 'err');
       return;
     }
     statusEl.hidden = false;
-    statusEl.textContent = 'Confira os dados detectados:';
+    statusEl.textContent = 'Confira e edite os dados detectados:';
     statusEl.classList.remove('err');
     statusEl.classList.add('ok');
   }
   if (!confirmEl) return;
+
+  const nameVal = escapeAttr(parsed.name || '');
+  const phoneVal = escapeAttr(
+    parsed.phone ? formatPhoneBR(parsed.phone) : ''
+  );
+  const lVal = parsed.l != null ? escapeAttr(String(parsed.l)) : '';
+  const wVal = parsed.w != null ? escapeAttr(String(parsed.w)) : '';
+  const hVal = parsed.h != null ? escapeAttr(String(parsed.h)) : '';
+  const kgVal = parsed.kg != null ? escapeAttr(String(parsed.kg)) : '';
+  const gVal = parsed.g != null ? escapeAttr(String(parsed.g)) : '';
+  const raw = String(parsed.rawText || '').trim();
+  const rawBlock = raw
+    ? `<details class="ocr-raw">
+        <summary>Ver texto lido</summary>
+        <pre class="ocr-raw-text">${escapeHtml(raw)}</pre>
+      </details>`
+    : '';
+
   confirmEl.hidden = false;
   confirmEl.innerHTML = `
     <p class="ocr-confirm-title">Dados detectados</p>
-    <ul class="ocr-confirm-list">
-      <li><strong>Nome:</strong> ${escapeHtml(parsed.name || '—')}</li>
-      <li><strong>Medidas:</strong> ${escapeHtml(formatOcrMeasures(parsed))}</li>
-      <li><strong>Peso:</strong> ${escapeHtml(formatOcrWeight(parsed))}</li>
-    </ul>
+    <div class="ocr-confirm-fields">
+      <label class="ocr-field">
+        <span>Nome</span>
+        <input type="text" id="ocr-name" autocomplete="name" value="${nameVal}" placeholder="Nome do cliente" />
+      </label>
+      <label class="ocr-field">
+        <span>Telefone</span>
+        <input type="tel" id="ocr-phone" inputmode="tel" value="${phoneVal}" placeholder="(21) 99999-0000" />
+      </label>
+      <div class="ocr-field">
+        <span>Medidas (cm)</span>
+        <div class="ocr-measures-row">
+          <input type="number" id="ocr-l" inputmode="decimal" min="0" step="any" placeholder="C" value="${lVal}" />
+          <span class="ocr-x">×</span>
+          <input type="number" id="ocr-w" inputmode="decimal" min="0" step="any" placeholder="L" value="${wVal}" />
+          <span class="ocr-x">×</span>
+          <input type="number" id="ocr-h" inputmode="decimal" min="0" step="any" placeholder="A" value="${hVal}" />
+        </div>
+        <input type="text" id="ocr-measures-combo" class="ocr-measures-combo" placeholder="ou 10x10x10" />
+      </div>
+      <div class="ocr-field">
+        <span>Peso</span>
+        <div class="ocr-weight-row">
+          <input type="number" id="ocr-kg" inputmode="numeric" min="0" step="1" placeholder="kg" value="${kgVal}" />
+          <span class="ocr-unit">kg</span>
+          <input type="number" id="ocr-g" inputmode="numeric" min="0" max="999" step="1" placeholder="g" value="${gVal}" />
+          <span class="ocr-unit">g</span>
+        </div>
+        <input type="text" id="ocr-weight-combo" class="ocr-weight-combo" placeholder="ou 3.075 / Kg 3.600" />
+      </div>
+    </div>
+    ${rawBlock}
     <div class="btn-row">
       <button type="button" class="btn btn-secondary" id="ocr-cancel">Cancelar</button>
       <button type="button" class="btn btn-primary" id="ocr-apply">Usar estes dados</button>
     </div>
   `;
+
+  const combo = $('#ocr-measures-combo');
+  combo?.addEventListener('change', () => {
+    const m = parseMeasures(combo.value || '');
+    if (m.l != null) {
+      const el = $('#ocr-l');
+      if (el) el.value = String(m.l);
+    }
+    if (m.w != null) {
+      const el = $('#ocr-w');
+      if (el) el.value = String(m.w);
+    }
+    if (m.h != null) {
+      const el = $('#ocr-h');
+      if (el) el.value = String(m.h);
+    }
+  });
+  combo?.addEventListener('input', () => {
+    if (!/[x×X\-\/]/.test(combo.value || '')) return;
+    const m = parseMeasures(combo.value || '');
+    if (m.l == null) return;
+    if ($('#ocr-l')) $('#ocr-l').value = String(m.l);
+    if ($('#ocr-w')) $('#ocr-w').value = String(m.w);
+    if ($('#ocr-h')) $('#ocr-h').value = String(m.h);
+  });
+
+  const wCombo = $('#ocr-weight-combo');
+  const applyWeightCombo = () => {
+    const w = parseWeight(wCombo.value || '');
+    if (w.kg == null && w.g == null) return;
+    if ($('#ocr-kg')) $('#ocr-kg').value = String(w.kg || 0);
+    if ($('#ocr-g')) $('#ocr-g').value = String(w.g || 0);
+  };
+  wCombo?.addEventListener('change', applyWeightCombo);
+  wCombo?.addEventListener('blur', applyWeightCombo);
+
+  $('#ocr-phone')?.addEventListener('input', (e) => {
+    const el = e.target;
+    const pos = el.selectionStart;
+    const before = el.value.length;
+    el.value = formatPhoneBR(el.value);
+    const after = el.value.length;
+    try {
+      el.setSelectionRange(pos + (after - before), pos + (after - before));
+    } catch (_) {}
+  });
+
   $('#ocr-cancel')?.addEventListener('click', () => {
     confirmEl.hidden = true;
     confirmEl.innerHTML = '';
     if (statusEl) statusEl.hidden = true;
   });
   $('#ocr-apply')?.addEventListener('click', () => {
-    applyOcrParsed(parsed);
+    const fromUi = readOcrConfirmFields();
+    applyOcrParsed(fromUi);
     confirmEl.hidden = true;
     confirmEl.innerHTML = '';
     if (statusEl) {
@@ -1207,10 +1318,61 @@ function showOcrConfirm(parsed) {
   });
 }
 
+function readOcrConfirmFields() {
+  const numOrNull = (id) => {
+    const v = ($(id)?.value || '').trim();
+    if (v === '') return null;
+    const n = parseFloat(v.replace(',', '.'));
+    return Number.isFinite(n) ? n : null;
+  };
+  const intOrNull = (id) => {
+    const v = ($(id)?.value || '').trim();
+    if (v === '') return null;
+    const n = parseInt(v, 10);
+    return Number.isFinite(n) ? n : null;
+  };
+  // Prefer combo fields if filled
+  let l = numOrNull('#ocr-l');
+  let w = numOrNull('#ocr-w');
+  let h = numOrNull('#ocr-h');
+  const combo = ($('#ocr-measures-combo')?.value || '').trim();
+  if (combo) {
+    const m = parseMeasures(combo);
+    if (m.l != null) {
+      l = m.l;
+      w = m.w;
+      h = m.h;
+    }
+  }
+  let kg = intOrNull('#ocr-kg');
+  let g = intOrNull('#ocr-g');
+  const wCombo = ($('#ocr-weight-combo')?.value || '').trim();
+  if (wCombo) {
+    const pw = parseWeight(wCombo);
+    if (pw.kg != null || pw.g != null) {
+      kg = pw.kg != null ? pw.kg : 0;
+      g = pw.g != null ? pw.g : 0;
+    }
+  }
+  return {
+    name: ($('#ocr-name')?.value || '').trim(),
+    phone: ($('#ocr-phone')?.value || '').trim(),
+    l,
+    w,
+    h,
+    kg,
+    g,
+  };
+}
+
 function applyOcrParsed(parsed) {
   if (parsed.name) {
     const el = $('#f-name');
     if (el) el.value = parsed.name;
+  }
+  if (parsed.phone) {
+    const el = $('#f-phone');
+    if (el) el.value = formatPhoneBR(parsed.phone);
   }
   if (parsed.l != null) {
     const el = $('#f-l');

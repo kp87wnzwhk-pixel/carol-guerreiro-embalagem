@@ -178,7 +178,7 @@ Cada registro tem um campo `workDate` (`YYYY-MM-DD`, data local do aparelho) —
 3. Abra `https://<usuario>.github.io/<repo>/`
 4. No celular: **Adicionar à tela inicial** (PWA)
 
-O service worker usa cache `cgi-pack-v16` (scripts/CSS com `?v=16`). Após deploy o app tenta `skipWaiting` e mostra “Atualizando app…”. Se ficar preso, feche e reabra o PWA.
+O service worker usa cache `cgi-pack-v17` (scripts/CSS com `?v=17`). Após deploy o app tenta `skipWaiting` e mostra “Atualizando app…”. Se ficar preso, feche e reabra o PWA.
 
 ## Estrutura
 
@@ -195,7 +195,7 @@ js/ocr-fill.js        ← OCR autofill (nome/medidas/peso)
 js/cdn.json           ← Tesseract local/CDN
 vendor/               ← Tesseract.js offline
 manifest.json
-sw.js                 ← cache cgi-pack-v16
+sw.js                 ← cache cgi-pack-v17
 icons/
 README.md
 ```
