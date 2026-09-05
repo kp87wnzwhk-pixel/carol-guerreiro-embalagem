@@ -55,7 +55,8 @@ import {
   syncPullAll,
   syncUploadPhoto,
   syncDeletePhoto,
-  syncListPhotoUrls,
+  syncPullPhotos,
+  compressImageBlob,
   subscribeRecords,
 } from './sync.js';
 
@@ -196,6 +197,33 @@ async function maybePullRemote() {
   }
 }
 
+/**
+ * Puxa fotos remotas (Firestore) e grava no IndexedDB se ainda não existirem.
+ */
+async function hydratePhotosForRecord(recordId) {
+  if (!isSyncActive() || !recordId) return [];
+  try {
+    const remote = await syncPullPhotos(recordId);
+    if (!remote.length) return listPhotosForRecord(recordId);
+    const local = await listPhotosForRecord(recordId);
+    const localIds = new Set(local.map((p) => p.id));
+    for (const p of remote) {
+      if (!p?.blob || localIds.has(p.id)) continue;
+      await addPhoto(recordId, p.blob, {
+        id: p.id,
+        createdAt: p.createdAt,
+        kind: p.kind,
+        mime: p.mime || 'image/jpeg',
+      });
+      localIds.add(p.id);
+    }
+    return listPhotosForRecord(recordId);
+  } catch (err) {
+    console.warn('hydratePhotosForRecord:', err);
+    return listPhotosForRecord(recordId);
+  }
+}
+
 let unsubRecords = null;
 
 function startRealtimeSync() {
@@ -209,6 +237,11 @@ function startRealtimeSync() {
     if (!changed) return;
     // Não interromper formulário no meio da edição
     if (currentView === 'form') return;
+    if (currentView === 'detail' && detailId) {
+      // Re-render + hydrate fotos do detalhe visível
+      render();
+      return;
+    }
     if (currentView === 'home' || currentView === 'detail') {
       render();
     }
@@ -354,6 +387,11 @@ function openEditForm(id) {
   pendingPhotoBlobs = [];
   currentView = 'form';
   render();
+  if (isSyncActive() && id) {
+    hydratePhotosForRecord(id).then(() => {
+      if (currentView === 'form' && editingId === id) refreshPhotoPreview();
+    });
+  }
 }
 
 function filteredHomeRecords() {
@@ -768,10 +806,29 @@ async function saveForm() {
     records.push(rec);
   }
 
-  for (const blob of pendingPhotoBlobs) {
+  for (const rawBlob of pendingPhotoBlobs) {
+    let blob = rawBlob;
+    try {
+      blob = (await compressImageBlob(rawBlob, { maxEdge: 1280, quality: 0.7 })) || rawBlob;
+    } catch (e) {
+      console.warn('Compress foto:', e);
+      blob = rawBlob;
+    }
     const photoId = await addPhoto(rec.id, blob);
     try {
-      if (isSyncActive()) await syncUploadPhoto(rec.id, photoId, blob);
+      if (isSyncActive()) {
+        const result = await syncUploadPhoto(rec.id, photoId, blob, {
+          createdAt: new Date().toISOString(),
+          kind: 'box',
+        });
+        if (result && result.ok === false && result.reason === 'too_large') {
+          toast(
+            'Foto ainda grande demais para a nuvem (>~900KB). Ficou só neste aparelho.',
+            'err',
+            5000
+          );
+        }
+      }
     } catch (e) {
       console.warn('Upload foto:', e);
     }
@@ -928,7 +985,26 @@ async function loadDetailPhotos(recordId) {
   const host = $('#detail-photos');
   if (!host) return;
   try {
-    const photos = await listPhotosForRecord(recordId);
+    let photos = await listPhotosForRecord(recordId);
+    // IndexedDB vazio (ou incompleto): puxar da subcoleção Firestore e hidratar
+    if (isSyncActive()) {
+      if (!photos.length) {
+        photos = await hydratePhotosForRecord(recordId);
+      } else {
+        // Em background: buscar fotos novas de outros aparelhos
+        hydratePhotosForRecord(recordId).then((updated) => {
+          if (!updated?.length || updated.length === photos.length) return;
+          if (!$('#detail-photos') || detailId !== recordId) return;
+          const html = updated
+            .map((p) => {
+              const url = trackUrl(photoObjectURL(p));
+              return `<a class="gallery-item" href="${url}" target="_blank" rel="noopener"><img src="${url}" alt="Foto da caixa" /></a>`;
+            })
+            .join('');
+          $('#detail-photos').innerHTML = html;
+        });
+      }
+    }
     if (photos.length) {
       host.innerHTML = photos
         .map((p) => {
@@ -937,19 +1013,6 @@ async function loadDetailPhotos(recordId) {
         })
         .join('');
       return;
-    }
-    // Outro aparelho: fotos só no Storage — listar URLs remotas
-    if (isSyncActive()) {
-      const urls = await syncListPhotoUrls(recordId);
-      if (urls.length) {
-        host.innerHTML = urls
-          .map(
-            (url) =>
-              `<a class="gallery-item" href="${escapeAttr(url)}" target="_blank" rel="noopener"><img src="${escapeAttr(url)}" alt="Foto da caixa" /></a>`
-          )
-          .join('');
-        return;
-      }
     }
     host.innerHTML = '<p class="hint">Sem fotos.</p>';
   } catch {
@@ -984,7 +1047,7 @@ function renderSettings() {
       <section class="card">
         <h2 class="card-title">Sincronização</h2>
         <p class="hint">${escapeHtml(sync.message)}</p>
-        <p class="hint">Veja o README para configurar Firebase (Firestore + Storage).</p>
+        <p class="hint">Veja o README: fotos vão no Firestore (sem Blaze / Storage opcional).</p>
       </section>
       <section class="card">
         <button type="button" class="btn btn-secondary btn-lg btn-block" id="btn-lock">Bloquear (pedir PIN)</button>

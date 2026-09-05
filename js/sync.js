@@ -1,14 +1,19 @@
 /**
  * Camada de sincronização Firebase (opcional).
  * Com SYNC_ENABLED=false, todas as funções são no-ops / retornam local.
+ *
+ * Fotos: subcoleção Firestore embalagens/{id}/fotos/{photoId} (base64).
+ * Firebase Storage NÃO é necessário (plano Spark / sem Blaze).
  */
 import { SYNC_ENABLED, firebaseConfig, FIRESTORE_COLLECTION, STORAGE_PATH_PREFIX } from './firebase-config.js';
 
 let app = null;
 let db = null;
-let storage = null;
 let ready = false;
 let initError = null;
+
+/** Limite aproximado do campo base64 (~900KB) — docs Firestore ≤ 1 MiB. */
+export const PHOTO_BASE64_MAX = 900 * 1024;
 
 function configLooksFilled() {
   const c = firebaseConfig;
@@ -28,7 +33,7 @@ export function getSyncStatus() {
   }
   if (initError) return { mode: 'error', message: String(initError.message || initError) };
   if (!ready) return { mode: 'loading', message: 'Conectando Firebase…' };
-  return { mode: 'sync', message: 'Sincronização ativa (Firestore + Storage)' };
+  return { mode: 'sync', message: 'Sincronização ativa (Firestore · fotos na nuvem)' };
 }
 
 export async function initSync() {
@@ -39,10 +44,8 @@ export async function initSync() {
   try {
     const { initializeApp } = await import('https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js');
     const { getFirestore } = await import('https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js');
-    const { getStorage } = await import('https://www.gstatic.com/firebasejs/10.14.1/firebase-storage.js');
     app = initializeApp(firebaseConfig);
     db = getFirestore(app);
-    storage = getStorage(app);
     ready = true;
     initError = null;
     return true;
@@ -65,7 +68,15 @@ export async function syncUpsertRecord(record) {
 
 export async function syncDeleteRecord(id) {
   if (!isSyncActive() || !id) return;
-  const { doc, deleteDoc } = await import('https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js');
+  const { doc, deleteDoc, collection, getDocs } = await import(
+    'https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js'
+  );
+  try {
+    const fotosSnap = await getDocs(collection(db, FIRESTORE_COLLECTION, id, 'fotos'));
+    await Promise.all(fotosSnap.docs.map((d) => deleteDoc(d.ref)));
+  } catch (err) {
+    console.warn('Falha ao apagar fotos remotas do registro:', err);
+  }
   await deleteDoc(doc(db, FIRESTORE_COLLECTION, id));
 }
 
@@ -77,7 +88,6 @@ export async function syncPullAll() {
   snap.forEach((d) => list.push({ id: d.id, ...d.data() }));
   return list;
 }
-
 
 /**
  * Escuta em tempo real a coleção embalagens.
@@ -116,42 +126,137 @@ export function subscribeRecords(onChange) {
   };
 }
 
-/** Envia foto para Storage: embalagens/{recordId}/{photoId} */
-export async function syncUploadPhoto(recordId, photoId, blob) {
+/** Redimensiona (max edge) e comprime JPEG no browser via canvas. */
+export async function compressImageBlob(blob, { maxEdge = 1280, quality = 0.7 } = {}) {
+  if (!blob) return null;
+  let bitmap;
+  try {
+    bitmap = await createImageBitmap(blob);
+  } catch (err) {
+    console.warn('compressImageBlob: createImageBitmap falhou', err);
+    return blob;
+  }
+  const scale = Math.min(1, maxEdge / Math.max(bitmap.width, bitmap.height));
+  const w = Math.max(1, Math.round(bitmap.width * scale));
+  const h = Math.max(1, Math.round(bitmap.height * scale));
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) {
+    bitmap.close();
+    return blob;
+  }
+  ctx.drawImage(bitmap, 0, 0, w, h);
+  bitmap.close();
+  const out = await new Promise((resolve) => {
+    canvas.toBlob((b) => resolve(b), 'image/jpeg', quality);
+  });
+  return out || blob;
+}
+
+function blobToRawBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => {
+      const s = String(r.result || '');
+      const i = s.indexOf(',');
+      resolve(i >= 0 ? s.slice(i + 1) : s);
+    };
+    r.onerror = () => reject(r.error);
+    r.readAsDataURL(blob);
+  });
+}
+
+function rawBase64ToBlob(b64, mime = 'image/jpeg') {
+  const bin = atob(String(b64 || ''));
+  const arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  return new Blob([arr], { type: mime || 'image/jpeg' });
+}
+
+/**
+ * Grava foto na subcoleção Firestore (não usa Storage).
+ * @returns {{ ok: true } | { ok: false, reason: 'too_large' } | null}
+ */
+export async function syncUploadPhoto(recordId, photoId, blob, meta = {}) {
   if (!isSyncActive() || !recordId || !photoId || !blob) return null;
-  const { ref, uploadBytes, getDownloadURL } = await import(
-    'https://www.gstatic.com/firebasejs/10.14.1/firebase-storage.js'
-  );
-  const path = `${STORAGE_PATH_PREFIX}/${recordId}/${photoId}`;
-  const r = ref(storage, path);
-  await uploadBytes(r, blob, { contentType: blob.type || 'image/jpeg' });
-  return getDownloadURL(r);
+  const dataBase64 = await blobToRawBase64(blob);
+  if (dataBase64.length > PHOTO_BASE64_MAX) {
+    return { ok: false, reason: 'too_large' };
+  }
+  const { doc, setDoc } = await import('https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js');
+  const payload = {
+    id: photoId,
+    kind: meta.kind || 'box',
+    createdAt: meta.createdAt || new Date().toISOString(),
+    mime: 'image/jpeg',
+    dataBase64,
+  };
+  await setDoc(doc(db, FIRESTORE_COLLECTION, recordId, 'fotos', photoId), payload, { merge: true });
+  return { ok: true };
 }
 
 export async function syncDeletePhoto(recordId, photoId) {
   if (!isSyncActive() || !recordId || !photoId) return;
   try {
-    const { ref, deleteObject } = await import(
-      'https://www.gstatic.com/firebasejs/10.14.1/firebase-storage.js'
-    );
-    const path = `${STORAGE_PATH_PREFIX}/${recordId}/${photoId}`;
-    await deleteObject(ref(storage, path));
+    const { doc, deleteDoc } = await import('https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js');
+    await deleteDoc(doc(db, FIRESTORE_COLLECTION, recordId, 'fotos', photoId));
   } catch (err) {
-    console.warn('Falha ao apagar foto no Storage:', err);
+    console.warn('Falha ao apagar foto no Firestore:', err);
   }
 }
 
-export async function syncListPhotoUrls(recordId) {
+/**
+ * Lê embalagens/{recordId}/fotos e devolve { id, kind, createdAt, mime, blob }[].
+ */
+export async function syncPullPhotos(recordId) {
   if (!isSyncActive() || !recordId) return [];
   try {
-    const { ref, listAll, getDownloadURL } = await import(
-      'https://www.gstatic.com/firebasejs/10.14.1/firebase-storage.js'
+    const { collection, getDocs } = await import(
+      'https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js'
     );
-    const folder = ref(storage, `${STORAGE_PATH_PREFIX}/${recordId}`);
-    const res = await listAll(folder);
-    const urls = await Promise.all(res.items.map((item) => getDownloadURL(item)));
-    return urls;
-  } catch {
+    const snap = await getDocs(collection(db, FIRESTORE_COLLECTION, recordId, 'fotos'));
+    const list = [];
+    snap.forEach((d) => {
+      const data = d.data() || {};
+      const mime = data.mime || 'image/jpeg';
+      const b64 = data.dataBase64;
+      if (!b64) return;
+      list.push({
+        id: data.id || d.id,
+        kind: data.kind || 'box',
+        createdAt: data.createdAt || '',
+        mime,
+        blob: rawBase64ToBlob(b64, mime),
+      });
+    });
+    list.sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
+    return list;
+  } catch (err) {
+    console.warn('syncPullPhotos:', err);
     return [];
   }
+}
+
+/**
+ * Compat: devolve data URLs das fotos remotas (Firestore). Storage não é usado.
+ * Preferir syncPullPhotos + IndexedDB.
+ */
+export async function syncListPhotoUrls(recordId) {
+  const photos = await syncPullPhotos(recordId);
+  return photos.map((p) => {
+    const url = URL.createObjectURL(p.blob);
+    return url;
+  });
+}
+
+/* ---- Storage leftovers (unused / no-op) — plano Spark sem Blaze ---- */
+export async function syncUploadPhotoStorage(/* recordId, photoId, blob */) {
+  void STORAGE_PATH_PREFIX;
+  return null;
+}
+
+export async function syncDeletePhotoStorage(/* recordId, photoId */) {
+  return;
 }

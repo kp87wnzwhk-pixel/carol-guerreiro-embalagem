@@ -31,14 +31,15 @@ function txDone(tx) {
 
 export async function addPhoto(recordId, blob, meta = {}) {
   const db = await openDB();
-  const id = crypto.randomUUID();
+  const id = meta.id || crypto.randomUUID();
   const record = {
     id,
     recordId: String(recordId),
     blob,
-    mime: blob.type || 'image/jpeg',
-    createdAt: new Date().toISOString(),
+    mime: blob.type || meta.mime || 'image/jpeg',
+    createdAt: meta.createdAt || new Date().toISOString(),
     ...meta,
+    id, // garantir id estável (hydrate remoto)
   };
   const tx = db.transaction(STORE, 'readwrite');
   tx.objectStore(STORE).put(record);

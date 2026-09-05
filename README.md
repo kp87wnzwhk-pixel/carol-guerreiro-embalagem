@@ -10,7 +10,7 @@ App **estático** (PWA mobile-first) para registrar caixas embaladas no armazém
 - PIN da equipe (padrão temporário: **`2026`**)
 - Durabilidade local reforçada (espelho + auto-backups + download automático)
 - Backup JSON (exportar / importar)
-- Sincronização multi-aparelho via Firebase Firestore + Storage (**ligada** neste deploy)
+- Sincronização multi-aparelho via **Firestore** (registros **e fotos** — **sem** Firebase Storage / sem Blaze)
 
 ## Abrir localmente
 
@@ -74,17 +74,34 @@ Ecrã **Backup**:
 - Importar JSON (com confirmação)
 - Estado: último save, último auto-backup, contagem
 
-## Sincronização multi-aparelho (Firebase)
+## Sincronização multi-aparelho (Firebase Firestore)
 
 Neste repositório a sync está **ativa** (`SYNC_ENABLED = true` + credenciais do projeto `carol-embalagem`).
 
-**Obrigatório no Console:** criar **Firestore Database** e **Storage** em **modo de teste** (test mode) se ainda não existirem. Sem isso o app local continua a funcionar, mas a nuvem falha (permissões / resource-not-found).
+**Não precisa de Blaze nem de Firebase Storage.** Registros e fotos ficam no Firestore (plano Spark).
+
+**Obrigatório no Console:** criar **Firestore Database** em **modo de teste** (test mode) se ainda não existir. Sem isso o app local continua a funcionar, mas a nuvem falha (permissões / resource-not-found).
 
 1. Abra [Firebase Console](https://console.firebase.google.com) → projeto `carol-embalagem`
 2. Crie **Firestore Database** → escolha **start in test mode**
-3. Crie **Storage** → também em **test mode**
+3. Storage é **opcional** (não usado pelo happy path; pode ignorar)
 4. Se o assistente já fechou o modo teste, cole as regras abertas abaixo
-5. Coleção Firestore: `embalagens` · fotos: `embalagens/{id}/…`
+5. Coleção: `embalagens` · fotos: `embalagens/{recordId}/fotos/{photoId}`
+
+### Fotos na nuvem (Firestore)
+
+| Campo | Valor |
+|-------|--------|
+| Caminho | `embalagens/{recordId}/fotos/{photoId}` |
+| `id` | id da foto |
+| `kind` | ex. `box` |
+| `createdAt` | ISO |
+| `mime` | `image/jpeg` |
+| `dataBase64` | base64 **cru** (sem prefixo `data:image/...;base64,`) |
+
+Antes do upload o app **redimensiona** no browser (canvas): aresta máxima **1280px**, JPEG qualidade **~0.7**. Se o base64 ainda passar de **~900KB**, o upload para a nuvem é **ignorado** (toast de aviso) — a foto fica só no IndexedDB deste aparelho. Limite de documento Firestore ≈ **1 MiB**.
+
+No detalhe: galeria lê IndexedDB primeiro; se vazio (ou para completar), puxa a subcoleção `fotos` e hidrata o IndexedDB.
 
 ### Regras sugeridas (teste / equipe pequena)
 
@@ -92,7 +109,7 @@ Neste repositório a sync está **ativa** (`SYNC_ENABLED = true` + credenciais d
 
 O app usa PIN no cliente — **não** substitui autenticação Firebase. Para produção, prefira Auth + regras por usuário. Em teste rápido (só equipe interna), cole:
 
-**Firestore**
+**Firestore** (inclui subcoleção `fotos`)
 
 ```
 rules_version = '2';
@@ -100,12 +117,15 @@ service cloud.firestore {
   match /databases/{database}/documents {
     match /embalagens/{doc} {
       allow read, write: if true; // TROQUE por Auth em produção
+      match /fotos/{photoId} {
+        allow read, write: if true;
+      }
     }
   }
 }
 ```
 
-**Storage**
+**Storage (opcional / futuro)** — só se um dia migrar fotos para Storage no Blaze:
 
 ```
 rules_version = '2';
@@ -136,7 +156,7 @@ Cada registro tem um campo `workDate` (`YYYY-MM-DD`, data local do aparelho) —
 3. Abra `https://<usuario>.github.io/<repo>/`
 4. No celular: **Adicionar à tela inicial** (PWA)
 
-O service worker usa cache `cgi-pack-v5` — após deploy, feche e reabra o PWA (ou limpe só o cache do SW) para receber a atualização.
+O service worker usa cache `cgi-pack-v6` — após deploy, feche e reabra o PWA (ou limpe só o cache do SW) para receber a atualização.
 
 ## Estrutura
 
@@ -147,14 +167,14 @@ js/app.js
 js/config.js          ← TEAM_PIN + STORAGE_KEYS
 js/storage.js         ← dual-write, auto-backups, recovery
 js/db.js              ← IndexedDB fotos
-js/sync.js
+js/sync.js            ← Firestore (registros + fotos base64)
 js/firebase-config.js ← SYNC_ENABLED + credenciais
 manifest.json
-sw.js                 ← cache cgi-pack-v5
+sw.js                 ← cache cgi-pack-v6
 icons/
 README.md
 ```
 
 ## Privacidade
 
-Telefones e fotos ficam no navegador (e no Firebase se a sync estiver ligada). Use HTTPS em produção e restrinja as regras do Firebase.
+Telefones e fotos ficam no navegador (e no Firestore se a sync estiver ligada). Use HTTPS em produção e restrinja as regras do Firebase.

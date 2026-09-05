@@ -3,11 +3,12 @@
  *
  * Para sincronizar entre celulares:
  * 1. Crie um projeto em https://console.firebase.google.com
- * 2. Ative Firestore Database e Storage
+ * 2. Ative **Firestore Database** (modo teste). Storage NÃO é obrigatório.
  * 3. Cole as credenciais abaixo (firebaseConfig)
  * 4. Defina SYNC_ENABLED = true
  * 5. Regras sugeridas no README (com PIN no app, não no Firebase)
  *
+ * Fotos: subcoleção Firestore embalagens/{id}/fotos (base64 comprimido).
  * Não inicialize Analytics neste app estático.
  */
 export const SYNC_ENABLED = true;
@@ -22,6 +23,6 @@ export const firebaseConfig = {
   measurementId: 'G-HSF638QS2N',
 };
 
-/** Coleção Firestore e caminho no Storage */
+/** Coleção Firestore. STORAGE_PATH_PREFIX legado (Storage opcional / não usado no happy path). */
 export const FIRESTORE_COLLECTION = 'embalagens';
 export const STORAGE_PATH_PREFIX = 'embalagens';
