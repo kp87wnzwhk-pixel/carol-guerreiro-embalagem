@@ -81,7 +81,7 @@ function normalizeCreatedBy(raw) {
   const s = String(raw || '').trim();
   if (!s) return '';
   if (REGISTRARS.includes(s)) return s;
-  const low = s.toLowerCase().normalize('NFD').replace(/\p{M}/gu, '');
+  const low = s.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
   if (low.includes('jessica') || low.includes('jéssica') || low === 'jessica') return 'Jessica';
   if (low.includes('guilherme') || low.includes('aprendiz')) return 'Aprendiz Guilherme';
   if (low.includes('carlos') || low.includes('mestre') || low.includes('anciao') || low.includes('ancião')) return 'Ancião Carlos 👑';
@@ -129,6 +129,19 @@ function toast(msg, type = '', ms = 3200) {
   toast._t = setTimeout(() => {
     el.classList.remove('show');
   }, ms);
+}
+
+/** Race a promise against a timeout; rejects with { code: 'TIMEOUT' }. */
+function withTimeout(promise, ms = 8000) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const err = new Error('timeout');
+      err.code = 'TIMEOUT';
+      reject(err);
+    }, ms);
+  });
+  return Promise.race([Promise.resolve(promise), timeout]).finally(() => clearTimeout(timer));
 }
 
 function downloadBlob(filename, blob) {
@@ -260,7 +273,7 @@ async function maybePullRemote() {
   try {
     // Tombstones remotos primeiro — evita ressuscitar na merge
     try {
-      const excluded = await syncPullExcludedIds();
+      const excluded = await withTimeout(syncPullExcludedIds(), 8000);
       absorbTombstoneIds(excluded);
     } catch (err) {
       console.warn('Pull excluidos falhou:', err);
@@ -1919,19 +1932,41 @@ async function boot() {
   getDeletedIds(); // init cache
   purgeLocalTombstoned();
   recoveryBanner = peekRecoveryBanner();
-  await initSync();
-  migrateRegistrarNames();
-  await maybePullRemote();
+  // Render PIN/UI first — never wait on Firebase/network for first paint
+  render();
+
+  let cloudSlow = false;
+  const noteSlow = (err, label) => {
+    console.warn(label + ':', err);
+    if (err && err.code === 'TIMEOUT') cloudSlow = true;
+  };
+
   try {
-    const n = await collapseVanessaDuplicates();
+    await withTimeout(initSync(), 8000);
+  } catch (err) {
+    noteSlow(err, 'initSync');
+  }
+
+  migrateRegistrarNames();
+
+  try {
+    await withTimeout(maybePullRemote(), 8000);
+  } catch (err) {
+    noteSlow(err, 'maybePullRemote');
+  }
+
+  try {
+    const n = await withTimeout(collapseVanessaDuplicates(), 8000);
     if (n > 0) {
       console.info('Vanessa duplicates collapsed:', n);
     }
   } catch (err) {
-    console.warn('collapseVanessaDuplicates:', err);
+    noteSlow(err, 'collapseVanessaDuplicates');
   }
+
   startRealtimeSync();
   render();
+  if (cloudSlow) toast('Nuvem lenta — modo local');
 
   // Após pull: caixas antigas com fotos só no IDB sobem sozinhas (concorrência 2)
   queueBootPhotoBackfill(2).catch((e) => console.warn('boot photo backfill:', e));
@@ -1944,7 +1979,7 @@ async function boot() {
         updateToastShown = true;
         toast('Atualizando app…', '', 3500);
       };
-      const reg = await navigator.serviceWorker.register('./sw.js?v=14');
+      const reg = await navigator.serviceWorker.register('./sw.js?v=15');
       if (navigator.serviceWorker.controller) {
         navigator.serviceWorker.controller.postMessage({ type: 'SKIP_WAITING' });
       }
@@ -1968,4 +2003,8 @@ async function boot() {
   }
 }
 
-boot();
+boot().catch((err) => {
+  console.error(err);
+  try { render(); } catch (_) {}
+  toast('Erro ao iniciar: ' + (err && err.message ? err.message : String(err)));
+});

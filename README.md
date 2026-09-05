@@ -177,7 +177,7 @@ Cada registro tem um campo `workDate` (`YYYY-MM-DD`, data local do aparelho) —
 3. Abra `https://<usuario>.github.io/<repo>/`
 4. No celular: **Adicionar à tela inicial** (PWA)
 
-O service worker usa cache `cgi-pack-v14` (scripts/CSS com `?v=14`). Após deploy o app tenta `skipWaiting` e mostra “Atualizando app…”. Se ficar preso, feche e reabra o PWA.
+O service worker usa cache `cgi-pack-v15` (scripts/CSS com `?v=15`). Após deploy o app tenta `skipWaiting` e mostra “Atualizando app…”. Se ficar preso, feche e reabra o PWA.
 
 ## Estrutura
 
@@ -191,7 +191,7 @@ js/db.js              ← IndexedDB fotos
 js/sync.js            ← Firestore (registros + photosInline; chunks secundário)
 js/firebase-config.js ← SYNC_ENABLED + credenciais
 manifest.json
-sw.js                 ← cache cgi-pack-v14
+sw.js                 ← cache cgi-pack-v15
 icons/
 README.md
 ```
