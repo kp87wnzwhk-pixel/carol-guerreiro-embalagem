@@ -321,19 +321,21 @@ async function upsertRecordWithInlinePhotos(rec) {
   const localPhotos = await listPhotosForRecord(rec.id);
   const { inline, skipped } = await buildPhotosInline(localPhotos);
   const now = new Date().toISOString();
-  rec.photosInline = inline;
   rec.photoCount = localPhotos.length || inline.length;
   rec.updatedAt = now;
-  records = records.map((r) => (r.id === rec.id ? { ...rec } : r));
+  records = records.map((r) => (r.id === rec.id ? { ...rec, photosInline: r.photosInline } : r));
   // Manter photosInline só em memória; localStorage via normalize/save limpa
   persistLocal();
   const mem = getRecord(rec.id);
   if (mem) {
-    mem.photosInline = inline;
+    mem.photoCount = rec.photoCount;
     mem.updatedAt = now;
   }
 
   if (!isSyncActive()) {
+    // Sem nuvem: guarda inline em memória para a UI local
+    if (mem) mem.photosInline = inline;
+    rec.photosInline = inline;
     return { ok: true, count: inline.length, message: 'Sync inativa — fotos só locais' };
   }
   try {
@@ -347,7 +349,15 @@ async function upsertRecordWithInlinePhotos(rec) {
   } catch (err) {
     const msg = err?.message || String(err);
     console.warn('upsertRecordWithInlinePhotos:', err);
+    // Não marcar photosInline como sincronizado — backfill automático pode tentar de novo
     return { ok: false, count: 0, message: msg };
+  }
+
+  // Sucesso: anexa inline em memória (espelha o remoto)
+  rec.photosInline = inline;
+  if (mem) {
+    mem.photosInline = inline;
+    mem.updatedAt = now;
   }
 
   // Secundário: chunks (não bloqueia sucesso)
@@ -363,6 +373,120 @@ async function upsertRecordWithInlinePhotos(rec) {
   }
   void skipped;
   return { ok: true, count: inline.length };
+}
+
+/* ---------- Auto photo cloud sync ---------- */
+/** In-flight + once-per-session debounce por record id */
+const autoPhotoUploadInFlight = new Map();
+const autoPhotoUploadAttempted = new Set();
+
+function inlinePhotoCount(rec) {
+  return Array.isArray(rec?.photosInline) ? rec.photosInline.length : 0;
+}
+
+async function recordNeedsPhotoCloudUpload(recordId) {
+  if (!recordId || !isSyncActive()) return false;
+  const rec = getRecord(recordId);
+  if (!rec) return false;
+  let localPhotos;
+  try {
+    localPhotos = await listPhotosForRecord(recordId);
+  } catch {
+    return false;
+  }
+  if (!localPhotos.length) return false;
+  return localPhotos.length > inlinePhotoCount(rec);
+}
+
+/**
+ * Pipeline automático: IDB → buildPhotosInline → syncUpsertRecord.
+ * Debounce por id (in-flight + attempted nesta sessão).
+ * @param {string} recordId
+ * @param {{ toastProgress?: boolean, force?: boolean }} [opts]
+ */
+async function autoUploadPhotosForRecord(recordId, opts = {}) {
+  const toastProgress = !!opts.toastProgress;
+  const force = !!opts.force;
+  if (!recordId || !isSyncActive()) return { ok: false, skipped: true };
+
+  if (autoPhotoUploadInFlight.has(recordId)) {
+    return autoPhotoUploadInFlight.get(recordId);
+  }
+  if (!force && autoPhotoUploadAttempted.has(recordId)) {
+    return { ok: true, skipped: true, count: 0 };
+  }
+
+  const run = (async () => {
+    try {
+      const needs = force ? true : await recordNeedsPhotoCloudUpload(recordId);
+      if (!needs) return { ok: true, skipped: true, count: 0 };
+
+      const rec = getRecord(recordId);
+      if (!rec) return { ok: false, count: 0, message: 'Registro não encontrado' };
+
+      const localPhotos = await listPhotosForRecord(recordId);
+      if (!localPhotos.length) {
+        return { ok: true, skipped: true, count: 0 };
+      }
+
+      autoPhotoUploadAttempted.add(recordId);
+      if (toastProgress) toast('Enviando fotos…', '', 3500);
+
+      const result = await upsertRecordWithInlinePhotos(rec);
+      if (!result.ok) {
+        // Permite nova tentativa automática mais tarde / botão manual
+        autoPhotoUploadAttempted.delete(recordId);
+        if (toastProgress) {
+          toast(`Falha ao enviar fotos: ${result.message || 'erro'}`, 'err', 6000);
+        }
+        return result;
+      }
+      if (toastProgress && result.count > 0) {
+        toast('Fotos sincronizadas', 'ok', 3500);
+      } else if (toastProgress && result.count === 0 && localPhotos.length) {
+        toast('Nenhuma foto coube após comprimir.', 'err', 5000);
+      }
+      return result;
+    } catch (err) {
+      autoPhotoUploadAttempted.delete(recordId);
+      const msg = err?.message || String(err);
+      console.warn('autoUploadPhotosForRecord:', err);
+      if (toastProgress) toast(`Falha ao enviar fotos: ${msg}`, 'err', 6000);
+      return { ok: false, count: 0, message: msg };
+    } finally {
+      autoPhotoUploadInFlight.delete(recordId);
+    }
+  })();
+
+  autoPhotoUploadInFlight.set(recordId, run);
+  return run;
+}
+
+/** Fila de backfill no boot: concorrência limitada (default 2). Sem toasts por item. */
+async function queueBootPhotoBackfill(concurrency = 2) {
+  if (!isSyncActive()) return;
+  const candidates = [];
+  for (const r of records) {
+    if (!r?.id) continue;
+    if (autoPhotoUploadAttempted.has(r.id) || autoPhotoUploadInFlight.has(r.id)) continue;
+    try {
+      if (await recordNeedsPhotoCloudUpload(r.id)) candidates.push(r.id);
+    } catch (_) {}
+  }
+  if (!candidates.length) return;
+
+  let idx = 0;
+  const workers = Array.from({ length: Math.min(concurrency, candidates.length) }, async () => {
+    while (idx < candidates.length) {
+      const id = candidates[idx++];
+      try {
+        await autoUploadPhotosForRecord(id, { toastProgress: false });
+      } catch (err) {
+        console.warn('boot photo backfill:', id, err);
+      }
+    }
+  });
+  await Promise.all(workers);
 }
 
 let unsubRecords = null;
@@ -490,6 +614,8 @@ function bindPin() {
       err.hidden = true;
       currentView = 'home';
       render();
+      // Opcional: backfill após desbloquear
+      queueBootPhotoBackfill(2).catch((e) => console.warn('photo backfill:', e));
       return;
     }
     if (input) input.value = '';
@@ -978,28 +1104,26 @@ async function saveForm() {
 
   let inlineResult = { ok: true, count: 0 };
   if (isSyncActive()) {
+    // Automático: após gravar no IDB, monta photosInline e faz upsert (sem botão)
     inlineResult = await upsertRecordWithInlinePhotos(rec);
-    if (!inlineResult.ok) {
+    if (inlineResult.ok) {
+      if (inlineResult.count > 0) autoPhotoUploadAttempted.add(rec.id);
+    } else {
       toast(
         `Falha ao enviar fotos na nuvem: ${inlineResult.message || 'erro'}`,
         'err',
         6000
       );
-    } else if (photos.length && inlineResult.count === 0) {
-      toast(
-        'Nenhuma foto coube no documento. No detalhe use “Enviar fotos para a nuvem”.',
-        'err',
-        6000
-      );
-    } else if (inlineResult.count > 0) {
-      // toast curto depois do afterSuccessfulSave
+    }
+    if (inlineResult.ok && photos.length && inlineResult.count === 0) {
+      toast('Nenhuma foto coube no documento após comprimir.', 'err', 6000);
     }
   }
 
   afterSuccessfulSave();
   if (isSyncActive() && inlineResult.ok && inlineResult.count > 0) {
     setTimeout(() => {
-      toast(`Fotos na nuvem: ${inlineResult.count}`, 'ok', 4000);
+      toast('Fotos na nuvem', 'ok', 2800);
     }, 4200);
   }
   detailId = rec.id;
@@ -1039,10 +1163,10 @@ function renderDetailShell() {
           ${r.notes ? `<div class="full"><dt>Observações</dt><dd>${escapeHtml(r.notes)}</dd></div>` : ''}
         </dl>
         <div class="photo-gallery" id="detail-photos"><p class="hint">Buscando fotos na nuvem…</p></div>
-        <button type="button" class="btn btn-secondary btn-sm btn-block" id="btn-reenviar-fotos" style="margin-top:10px;margin-bottom:4px">
-          Enviar fotos para a nuvem
+        <button type="button" class="btn btn-outline btn-sm btn-block" id="btn-reenviar-fotos" style="margin-top:10px;margin-bottom:4px;opacity:0.9;font-size:0.8rem">
+          Reenviar fotos (se falhou)
         </button>
-        <p class="hint" style="margin-top:0;margin-bottom:12px">Coloca até 3 fotos no próprio registro na nuvem (mesmo canal da lista). Use se outro celular mostrar “Sem fotos”.</p>
+        <p class="hint" style="margin-top:0;margin-bottom:12px">Opcional — as fotos sobem sozinhas ao salvar e ao abrir o detalhe. Use só se a nuvem falhou.</p>
         <div class="move-day-block">
           <p class="card-title" style="margin-bottom:8px">Mover para outro dia</p>
           <div class="btn-row">
@@ -1167,6 +1291,8 @@ async function loadDetailPhotos(recordId) {
       if (!$('#detail-photos') || detailId !== recordId) return;
       if (photos.length) {
         renderDetailPhotoGallery($('#detail-photos'), photos);
+        // Auto backfill se local tem mais fotos que photosInline remoto
+        autoUploadPhotosForRecord(recordId, { toastProgress: true }).catch(() => {});
         return;
       }
       // Fallback: decode photosInline direto (antes/sem IDB)
@@ -1175,6 +1301,14 @@ async function loadDetailPhotos(recordId) {
         renderDetailPhotoGallery($('#detail-photos'), inlinePhotos);
         return;
       }
+      // Sem fotos locais/remotas ainda — tenta backfill se IDB tiver (race) ou fica vazio
+      autoUploadPhotosForRecord(recordId, { toastProgress: true })
+        .then((res) => {
+          if (res && res.ok && res.count > 0 && detailId === recordId) {
+            loadDetailPhotos(recordId);
+          }
+        })
+        .catch(() => {});
       renderDetailPhotoGallery($('#detail-photos'), []);
       return;
     }
@@ -1191,7 +1325,7 @@ async function loadDetailPhotos(recordId) {
   }
 }
 
-/** Rebuild photosInline from local IDB and upsert record (caminho principal). */
+/** Retry manual (secundário) — força o mesmo pipeline automático. */
 async function reenviarFotosParaNuvem(recordId) {
   if (!isSyncActive()) {
     toast('Sincronização inativa. Ative o Firebase em firebase-config.js.', 'err');
@@ -1207,18 +1341,14 @@ async function reenviarFotosParaNuvem(recordId) {
     toast('Não há fotos locais neste aparelho para enviar.', 'err');
     return;
   }
-  toast(`Enviando fotos para a nuvem…`, '', 3500);
-  const result = await upsertRecordWithInlinePhotos(rec);
-  if (!result.ok) {
-    toast(`Erro ao enviar fotos: ${result.message || 'falha'}`, 'err', 6000);
-    return;
+  autoPhotoUploadAttempted.delete(recordId);
+  const result = await autoUploadPhotosForRecord(recordId, {
+    toastProgress: true,
+    force: true,
+  });
+  if (result?.ok && result.count > 0 && detailId === recordId) {
+    loadDetailPhotos(recordId);
   }
-  if (result.count === 0) {
-    toast('Nenhuma foto coube após comprimir. Tente fotos menores.', 'err', 5500);
-    return;
-  }
-  toast(`Fotos na nuvem: ${result.count}`, 'ok', 4500);
-  if (detailId === recordId) loadDetailPhotos(recordId);
 }
 
 /* ---------- Settings ---------- */
@@ -1543,6 +1673,9 @@ async function boot() {
   startRealtimeSync();
   render();
 
+  // Após pull: caixas antigas com fotos só no IDB sobem sozinhas (concorrência 2)
+  queueBootPhotoBackfill(2).catch((e) => console.warn('boot photo backfill:', e));
+
   if ('serviceWorker' in navigator) {
     try {
       let updateToastShown = false;
@@ -1551,7 +1684,7 @@ async function boot() {
         updateToastShown = true;
         toast('Atualizando app…', '', 3500);
       };
-      const reg = await navigator.serviceWorker.register('./sw.js?v=8');
+      const reg = await navigator.serviceWorker.register('./sw.js?v=9');
       if (navigator.serviceWorker.controller) {
         navigator.serviceWorker.controller.postMessage({ type: 'SKIP_WAITING' });
       }

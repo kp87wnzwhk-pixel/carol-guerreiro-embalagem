@@ -96,7 +96,8 @@ Campo no registro: **`photosInline`**: até **3** itens `{ id, mime, dataBase64,
 
 - Cada `dataBase64` ≤ **~280 KiB** (3 × 280 ≈ 840 KiB + campos &lt; limite 1 MiB do Firestore)
 - `photoCount` continua no registro
-- Ao **salvar** ou tocar **Enviar fotos para a nuvem**, o app comprime (canvas) e faz `setDoc` merge do registro com `photosInline`
+- Ao **salvar** (create/edit), o app **automaticamente** comprime (canvas), monta `photosInline` e faz `setDoc` merge — sem botão extra
+- **Backfill automático**: ao abrir o detalhe (e na home após desbloquear / no boot após pull), se o IndexedDB local tiver mais fotos do que `photosInline` remoto, sobe sozinho (debounce por id; concorrência 2 no boot)
 - No outro aparelho, o pull/subscribe lê `photosInline`, grava no IndexedDB (`hydrateInlinePhotos`) e mostra a galeria; se o IDB ainda estiver vazio, decodifica o base64 direto para a UI
 
 **Compressão agressiva** (loop no canvas):
@@ -108,14 +109,14 @@ Se o upsert inline falhar, o toast mostra o **erro real** (permissão / tamanho 
 
 **Secundário (opcional):** ainda tenta a subcoleção `embalagens/{id}/fotos/{photoId}` + `chunks/` (compatibilidade). O sucesso exigido é o **inline no registro**.
 
-**iPhone / HEIC:** o canvas reencode para JPEG; se a foto não aparecer noutro telemóvel, abra o detalhe e toque **Enviar fotos para a nuvem** uma vez (rebuild do `photosInline`).
+**iPhone / HEIC:** o canvas reencode para JPEG; se a foto não aparecer noutro telemóvel, abra o detalhe (backfill automático) ou use **Reenviar fotos (se falhou)**.
 
 Download automático JSON **leve** omite `photosInline` (só metadados / `photoCount`). O **backup completo com fotos** usa as fotos do IndexedDB.
 
 No **detalhe**:
 
-- Ao abrir, hidrata da nuvem (`Buscando fotos na nuvem…`) antes de “Sem fotos.”
-- Botão **Enviar fotos para a nuvem** reconstrói `photosInline` a partir do IndexedDB local e faz upsert — toast `Fotos na nuvem: N`
+- Ao abrir, hidrata da nuvem (`Buscando fotos na nuvem…`) e, se faltarem fotos na nuvem, **envia automaticamente** (`Enviando fotos…` → `Fotos sincronizadas`)
+- Botão secundário **Reenviar fotos (se falhou)** — retry manual do mesmo pipeline
 
 ### Regras sugeridas (teste / equipe pequena)
 
@@ -173,7 +174,7 @@ Cada registro tem um campo `workDate` (`YYYY-MM-DD`, data local do aparelho) —
 3. Abra `https://<usuario>.github.io/<repo>/`
 4. No celular: **Adicionar à tela inicial** (PWA)
 
-O service worker usa cache `cgi-pack-v8` (scripts/CSS com `?v=8`). Após deploy o app tenta `skipWaiting` e mostra “Atualizando app…”. Se ficar preso, feche e reabra o PWA.
+O service worker usa cache `cgi-pack-v9` (scripts/CSS com `?v=9`). Após deploy o app tenta `skipWaiting` e mostra “Atualizando app…”. Se ficar preso, feche e reabra o PWA.
 
 ## Estrutura
 
@@ -187,7 +188,7 @@ js/db.js              ← IndexedDB fotos
 js/sync.js            ← Firestore (registros + photosInline; chunks secundário)
 js/firebase-config.js ← SYNC_ENABLED + credenciais
 manifest.json
-sw.js                 ← cache cgi-pack-v8
+sw.js                 ← cache cgi-pack-v9
 icons/
 README.md
 ```
