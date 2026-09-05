@@ -57,6 +57,9 @@ import {
   syncDeletePhoto,
   syncPullPhotos,
   compressUntilFit,
+  buildPhotosInline,
+  rawBase64ToBlob,
+  PHOTO_INLINE_MAX,
   subscribeRecords,
 } from './sync.js';
 
@@ -113,17 +116,21 @@ function downloadBlob(filename, blob) {
   setTimeout(() => URL.revokeObjectURL(url), 2000);
 }
 
-/** Metadata-only backup (small) — records + photoCount, sem fotos base64. */
+/** Metadata-only backup (small) — records + photoCount, sem photosInline/base64. */
 function buildMetadataPayload() {
   return {
     app: 'carol-guerreiro-embalagem',
     kind: 'metadata',
     exportedAt: new Date().toISOString(),
     recordCount: records.length,
-    records: records.map((r) => ({
-      ...r,
-      photoCount: Number(r.photoCount) || 0,
-    })),
+    records: records.map((r) => {
+      const { photosInline, ...rest } = r || {};
+      void photosInline;
+      return {
+        ...rest,
+        photoCount: Number(r.photoCount) || 0,
+      };
+    }),
   };
 }
 
@@ -166,6 +173,20 @@ function requireUnlock() {
 }
 
 /* ---------- Merge remote ---------- */
+function attachInlineFromRemote(remoteList) {
+  const inlineById = new Map();
+  for (const r of remoteList || []) {
+    if (r?.id && Array.isArray(r.photosInline) && r.photosInline.length) {
+      inlineById.set(r.id, r.photosInline);
+    }
+  }
+  for (const [id, photosInline] of inlineById) {
+    const rec = records.find((x) => x.id === id);
+    if (rec) rec.photosInline = photosInline;
+  }
+  return inlineById;
+}
+
 function mergeRemoteIntoLocal(remote) {
   if (!Array.isArray(remote)) return false;
   const map = new Map(records.map((r) => [r.id, r]));
@@ -183,6 +204,13 @@ function mergeRemoteIntoLocal(remote) {
     records = [...map.values()];
     persistLocal();
   }
+  // photosInline não vai ao localStorage (normalize); reanexa em memória e hidrata IDB
+  const inlineById = attachInlineFromRemote(remote);
+  for (const [id, photosInline] of inlineById) {
+    hydrateInlinePhotos({ id, photosInline }).catch((err) =>
+      console.warn('hydrateInlinePhotos:', err)
+    );
+  }
   return changed;
 }
 
@@ -198,31 +226,143 @@ async function maybePullRemote() {
 }
 
 /**
- * Puxa fotos remotas (Firestore) e grava no IndexedDB se ainda não existirem.
+ * Grava photosInline do documento Firestore no IndexedDB (skip ids existentes).
  */
-async function hydratePhotosForRecord(recordId) {
-  if (!recordId) return [];
-  if (!isSyncActive()) return listPhotosForRecord(recordId);
-  try {
-    const remote = await syncPullPhotos(recordId);
-    if (!remote.length) return listPhotosForRecord(recordId);
-    const local = await listPhotosForRecord(recordId);
-    const localIds = new Set(local.map((p) => p.id));
-    for (const p of remote) {
-      if (!p?.blob || localIds.has(p.id)) continue;
-      await addPhoto(recordId, p.blob, {
+async function hydrateInlinePhotos(record) {
+  if (!record?.id || !Array.isArray(record.photosInline) || !record.photosInline.length) {
+    return;
+  }
+  const local = await listPhotosForRecord(record.id);
+  const localIds = new Set(local.map((p) => p.id));
+  for (const p of record.photosInline) {
+    if (!p?.id || !p?.dataBase64 || localIds.has(p.id)) continue;
+    try {
+      const blob = rawBase64ToBlob(p.dataBase64, p.mime || 'image/jpeg');
+      await addPhoto(record.id, blob, {
         id: p.id,
         createdAt: p.createdAt,
-        kind: p.kind,
+        kind: p.kind || 'box',
         mime: p.mime || 'image/jpeg',
       });
       localIds.add(p.id);
+    } catch (err) {
+      console.warn('hydrateInlinePhotos item:', err);
+    }
+  }
+}
+
+/**
+ * Puxa fotos remotas: 1) photosInline no registro 2) subcoleção/chunks (secundário).
+ */
+async function hydratePhotosForRecord(recordId) {
+  if (!recordId) return [];
+  const rec = getRecord(recordId);
+  if (rec?.photosInline?.length) {
+    await hydrateInlinePhotos(rec);
+  }
+  if (!isSyncActive()) return listPhotosForRecord(recordId);
+  try {
+    // Secondary: subcollection chunks (best-effort)
+    try {
+      const remote = await syncPullPhotos(recordId);
+      if (remote.length) {
+        const local = await listPhotosForRecord(recordId);
+        const localIds = new Set(local.map((p) => p.id));
+        for (const p of remote) {
+          if (!p?.blob || localIds.has(p.id)) continue;
+          await addPhoto(recordId, p.blob, {
+            id: p.id,
+            createdAt: p.createdAt,
+            kind: p.kind,
+            mime: p.mime || 'image/jpeg',
+          });
+          localIds.add(p.id);
+        }
+      }
+    } catch (err) {
+      console.warn('hydratePhotosForRecord chunks:', err);
     }
     return listPhotosForRecord(recordId);
   } catch (err) {
     console.warn('hydratePhotosForRecord:', err);
     return listPhotosForRecord(recordId);
   }
+}
+
+/** Decodifica photosInline direto para a galeria (blob URLs) sem esperar IDB. */
+function galleryFromInline(photosInline) {
+  if (!Array.isArray(photosInline) || !photosInline.length) return [];
+  return photosInline
+    .filter((p) => p?.dataBase64)
+    .map((p) => {
+      try {
+        const blob = rawBase64ToBlob(p.dataBase64, p.mime || 'image/jpeg');
+        return {
+          id: p.id,
+          blob,
+          mime: p.mime || 'image/jpeg',
+          createdAt: p.createdAt,
+          kind: p.kind || 'box',
+        };
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+}
+
+/**
+ * Caminho principal: monta photosInline (máx 3) e faz upsert do registro.
+ * Chunks ficam como tentativa secundária.
+ * @returns {{ ok: boolean, count: number, message?: string }}
+ */
+async function upsertRecordWithInlinePhotos(rec) {
+  if (!rec?.id) return { ok: false, count: 0, message: 'Registro inválido' };
+  const localPhotos = await listPhotosForRecord(rec.id);
+  const { inline, skipped } = await buildPhotosInline(localPhotos);
+  const now = new Date().toISOString();
+  rec.photosInline = inline;
+  rec.photoCount = localPhotos.length || inline.length;
+  rec.updatedAt = now;
+  records = records.map((r) => (r.id === rec.id ? { ...rec } : r));
+  // Manter photosInline só em memória; localStorage via normalize/save limpa
+  persistLocal();
+  const mem = getRecord(rec.id);
+  if (mem) {
+    mem.photosInline = inline;
+    mem.updatedAt = now;
+  }
+
+  if (!isSyncActive()) {
+    return { ok: true, count: inline.length, message: 'Sync inativa — fotos só locais' };
+  }
+  try {
+    // Enviar com photosInline no payload (updatedAt novo para os outros aparelhos puxarem)
+    await syncUpsertRecord({
+      ...rec,
+      photosInline: inline,
+      photoCount: rec.photoCount,
+      updatedAt: now,
+    });
+  } catch (err) {
+    const msg = err?.message || String(err);
+    console.warn('upsertRecordWithInlinePhotos:', err);
+    return { ok: false, count: 0, message: msg };
+  }
+
+  // Secundário: chunks (não bloqueia sucesso)
+  for (const p of localPhotos.slice(0, PHOTO_INLINE_MAX)) {
+    try {
+      await syncUploadPhoto(rec.id, p.id, p.blob, {
+        createdAt: p.createdAt,
+        kind: p.kind || 'box',
+      });
+    } catch (err) {
+      console.warn('chunk secundário:', err);
+    }
+  }
+  void skipped;
+  return { ok: true, count: inline.length };
 }
 
 let unsubRecords = null;
@@ -437,7 +577,7 @@ function renderHome() {
   const sync = getSyncStatus();
   const syncLabel =
     sync.mode === 'sync'
-      ? 'Nuvem ligada · todos os celulares veem a mesma lista'
+      ? 'Nuvem ligada · lista e fotos na mesma nuvem'
       : sync.message;
   const items = renderGroupedListHtml(list);
 
@@ -807,55 +947,27 @@ async function saveForm() {
     records.push(rec);
   }
 
-  let uploadFailCount = 0;
+  // Grava blobs locais (comprimidos) no IndexedDB primeiro
   for (const rawBlob of pendingPhotoBlobs) {
     let blob = rawBlob;
-    let tooLarge = false;
     try {
       const fitted = await compressUntilFit(rawBlob);
       blob = fitted.blob || rawBlob;
       if (!fitted.ok) {
-        tooLarge = true;
-        uploadFailCount += 1;
         toast(
-          'Foto ainda grande demais para a nuvem mesmo após comprimir. Ficou só neste aparelho.',
-          'err',
-          5500
+          'Foto muito grande mesmo após comprimir — tentaremos na nuvem mesmo assim se couber 1 capa.',
+          '',
+          4500
         );
       }
     } catch (e) {
       console.warn('Compress foto:', e);
       blob = rawBlob;
     }
-    const photoId = await addPhoto(rec.id, blob);
-    if (tooLarge) continue;
-    try {
-      if (isSyncActive()) {
-        const result = await syncUploadPhoto(rec.id, photoId, blob, {
-          createdAt: new Date().toISOString(),
-          kind: 'box',
-        });
-        if (result && result.ok === false) {
-          uploadFailCount += 1;
-          toast(
-            result.message ||
-              (result.reason === 'too_large'
-                ? 'Foto ainda grande demais para a nuvem. Ficou só neste aparelho.'
-                : 'Falha ao enviar foto para a nuvem.'),
-            'err',
-            5500
-          );
-        }
-      }
-    } catch (e) {
-      uploadFailCount += 1;
-      console.warn('Upload foto:', e);
-      toast(
-        `Falha ao enviar foto: ${e?.message || e || 'erro de rede/permissão'}`,
-        'err',
-        5500
-      );
-    }
+    await addPhoto(rec.id, blob, {
+      createdAt: new Date().toISOString(),
+      kind: 'box',
+    });
   }
   pendingPhotoBlobs = [];
 
@@ -864,33 +976,30 @@ async function saveForm() {
   records = records.map((r) => (r.id === rec.id ? rec : r));
   persistLocal();
 
-  try {
-    if (isSyncActive()) await syncUpsertRecord(rec);
-  } catch (e) {
-    console.warn('Sync upsert:', e);
-    toast(`Falha ao sincronizar registro: ${e?.message || e}`, 'err', 5000);
-  }
-
-  let cloudPhotoWarn = false;
-  if (isSyncActive() && photos.length && uploadFailCount === 0) {
-    try {
-      const remote = await syncPullPhotos(rec.id);
-      if (!remote.length) cloudPhotoWarn = true;
-    } catch (_) {
-      cloudPhotoWarn = true;
+  let inlineResult = { ok: true, count: 0 };
+  if (isSyncActive()) {
+    inlineResult = await upsertRecordWithInlinePhotos(rec);
+    if (!inlineResult.ok) {
+      toast(
+        `Falha ao enviar fotos na nuvem: ${inlineResult.message || 'erro'}`,
+        'err',
+        6000
+      );
+    } else if (photos.length && inlineResult.count === 0) {
+      toast(
+        'Nenhuma foto coube no documento. No detalhe use “Enviar fotos para a nuvem”.',
+        'err',
+        6000
+      );
+    } else if (inlineResult.count > 0) {
+      // toast curto depois do afterSuccessfulSave
     }
-  } else if (isSyncActive() && photos.length && uploadFailCount > 0) {
-    cloudPhotoWarn = true;
   }
 
   afterSuccessfulSave();
-  if (cloudPhotoWarn) {
+  if (isSyncActive() && inlineResult.ok && inlineResult.count > 0) {
     setTimeout(() => {
-      toast(
-        'Fotos podem não ter ido para a nuvem. No detalhe use “Enviar fotos para a nuvem”.',
-        'err',
-        6500
-      );
+      toast(`Fotos na nuvem: ${inlineResult.count}`, 'ok', 4000);
     }, 4200);
   }
   detailId = rec.id;
@@ -933,7 +1042,7 @@ function renderDetailShell() {
         <button type="button" class="btn btn-secondary btn-sm btn-block" id="btn-reenviar-fotos" style="margin-top:10px;margin-bottom:4px">
           Enviar fotos para a nuvem
         </button>
-        <p class="hint" style="margin-top:0;margin-bottom:12px">Reenvia as fotos deste aparelho (comprimidas em pedaços) se outro celular mostrar “Sem fotos”.</p>
+        <p class="hint" style="margin-top:0;margin-bottom:12px">Coloca até 3 fotos no próprio registro na nuvem (mesmo canal da lista). Use se outro celular mostrar “Sem fotos”.</p>
         <div class="move-day-block">
           <p class="card-title" style="margin-bottom:8px">Mover para outro dia</p>
           <div class="btn-row">
@@ -1051,15 +1160,29 @@ async function loadDetailPhotos(recordId) {
   const host = $('#detail-photos');
   if (!host) return;
   try {
+    const rec = getRecord(recordId);
     if (isSyncActive()) {
       host.innerHTML = '<p class="hint">Buscando fotos na nuvem…</p>';
       const photos = await hydratePhotosForRecord(recordId);
       if (!$('#detail-photos') || detailId !== recordId) return;
-      renderDetailPhotoGallery($('#detail-photos'), photos);
+      if (photos.length) {
+        renderDetailPhotoGallery($('#detail-photos'), photos);
+        return;
+      }
+      // Fallback: decode photosInline direto (antes/sem IDB)
+      const inlinePhotos = galleryFromInline(rec?.photosInline);
+      if (inlinePhotos.length) {
+        renderDetailPhotoGallery($('#detail-photos'), inlinePhotos);
+        return;
+      }
+      renderDetailPhotoGallery($('#detail-photos'), []);
       return;
     }
-    const photos = await listPhotosForRecord(recordId);
+    let photos = await listPhotosForRecord(recordId);
     if (!$('#detail-photos') || detailId !== recordId) return;
+    if (!photos.length) {
+      photos = galleryFromInline(rec?.photosInline);
+    }
     renderDetailPhotoGallery($('#detail-photos'), photos);
   } catch {
     if ($('#detail-photos') && detailId === recordId) {
@@ -1068,10 +1191,15 @@ async function loadDetailPhotos(recordId) {
   }
 }
 
-/** Reenvia todas as fotos locais do registro para o Firestore (compressão + chunks). */
+/** Rebuild photosInline from local IDB and upsert record (caminho principal). */
 async function reenviarFotosParaNuvem(recordId) {
   if (!isSyncActive()) {
     toast('Sincronização inativa. Ative o Firebase em firebase-config.js.', 'err');
+    return;
+  }
+  const rec = getRecord(recordId);
+  if (!rec) {
+    toast('Registro não encontrado.', 'err');
     return;
   }
   const photos = await listPhotosForRecord(recordId);
@@ -1079,39 +1207,18 @@ async function reenviarFotosParaNuvem(recordId) {
     toast('Não há fotos locais neste aparelho para enviar.', 'err');
     return;
   }
-  toast(`Enviando ${photos.length} foto(s) para a nuvem…`, '', 4000);
-  let ok = 0;
-  let fail = 0;
-  for (let i = 0; i < photos.length; i++) {
-    const p = photos[i];
-    toast(`Enviando foto ${i + 1}/${photos.length}…`, '', 3500);
-    try {
-      const result = await syncUploadPhoto(recordId, p.id, p.blob, {
-        createdAt: p.createdAt,
-        kind: p.kind || 'box',
-      });
-      if (result && result.ok) {
-        ok += 1;
-      } else {
-        fail += 1;
-        toast(
-          result?.message ||
-            `Falha na foto ${i + 1}: ${result?.reason || 'erro'}`,
-          'err',
-          5000
-        );
-      }
-    } catch (e) {
-      fail += 1;
-      console.warn('reenviarFotos:', e);
-      toast(`Falha na foto ${i + 1}: ${e?.message || e}`, 'err', 5000);
-    }
+  toast(`Enviando fotos para a nuvem…`, '', 3500);
+  const result = await upsertRecordWithInlinePhotos(rec);
+  if (!result.ok) {
+    toast(`Erro ao enviar fotos: ${result.message || 'falha'}`, 'err', 6000);
+    return;
   }
-  if (fail === 0) {
-    toast(`Pronto: ${ok} foto(s) na nuvem ✓`, 'ok', 4500);
-  } else {
-    toast(`Enviadas ${ok}, falharam ${fail}. Tente de novo.`, 'err', 5500);
+  if (result.count === 0) {
+    toast('Nenhuma foto coube após comprimir. Tente fotos menores.', 'err', 5500);
+    return;
   }
+  toast(`Fotos na nuvem: ${result.count}`, 'ok', 4500);
+  if (detailId === recordId) loadDetailPhotos(recordId);
 }
 
 /* ---------- Settings ---------- */
@@ -1141,7 +1248,7 @@ function renderSettings() {
       <section class="card">
         <h2 class="card-title">Sincronização</h2>
         <p class="hint">${escapeHtml(sync.message)}</p>
-        <p class="hint">Veja o README: fotos vão no Firestore (sem Blaze / Storage opcional).</p>
+        <p class="hint">Fotos vão no próprio documento da caixa (photosInline). Sem Blaze / Storage.</p>
       </section>
       <section class="card">
         <button type="button" class="btn btn-secondary btn-lg btn-block" id="btn-lock">Bloquear (pedir PIN)</button>
@@ -1307,6 +1414,7 @@ async function doExportFull() {
 
   for (const r of records) {
     const copy = { ...r, photos: [] };
+    delete copy.photosInline; // fotos vão em photos[] (IDB); evita duplicar base64 enorme
     if (includePhotos) {
       try {
         const photos = await listPhotosForRecord(r.id);
@@ -1437,7 +1545,30 @@ async function boot() {
 
   if ('serviceWorker' in navigator) {
     try {
-      await navigator.serviceWorker.register('./sw.js');
+      let updateToastShown = false;
+      const showUpdatingOnce = () => {
+        if (updateToastShown) return;
+        updateToastShown = true;
+        toast('Atualizando app…', '', 3500);
+      };
+      const reg = await navigator.serviceWorker.register('./sw.js?v=8');
+      if (navigator.serviceWorker.controller) {
+        navigator.serviceWorker.controller.postMessage({ type: 'SKIP_WAITING' });
+      }
+      if (reg.waiting) {
+        showUpdatingOnce();
+        reg.waiting.postMessage({ type: 'SKIP_WAITING' });
+      }
+      reg.addEventListener('updatefound', () => {
+        const nw = reg.installing;
+        if (!nw) return;
+        nw.addEventListener('statechange', () => {
+          if (nw.state === 'installed' && navigator.serviceWorker.controller) {
+            showUpdatingOnce();
+            nw.postMessage({ type: 'SKIP_WAITING' });
+          }
+        });
+      });
     } catch (err) {
       console.warn('SW:', err);
     }

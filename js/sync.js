@@ -2,8 +2,8 @@
  * Camada de sincronização Firebase (opcional).
  * Com SYNC_ENABLED=false, todas as funções são no-ops / retornam local.
  *
- * Fotos: subcoleção Firestore embalagens/{id}/fotos/{photoId}
- *   + chunks em embalagens/{id}/fotos/{photoId}/chunks/{i}
+ * Fotos (caminho principal): campo photosInline[] no documento embalagens/{id}
+ *   (até 3 fotos base64 ≤ ~280 KiB cada). Subcoleção/chunks fica como tentativa opcional.
  * Firebase Storage NÃO é necessário (plano Spark / sem Blaze).
  */
 import { SYNC_ENABLED, firebaseConfig, FIRESTORE_COLLECTION, STORAGE_PATH_PREFIX } from './firebase-config.js';
@@ -13,10 +13,13 @@ let db = null;
 let ready = false;
 let initError = null;
 
-/** Alvo de compressão (margem sob o limite 1 MiB do Firestore). */
-export const PHOTO_BASE64_MAX = 700 * 1024;
+/** Alvo por foto inline no documento (3 × 280 KiB ≈ 840 KiB + campos < 1 MiB). */
+export const PHOTO_BASE64_MAX = 280 * 1024;
 
-/** Tamanho aproximado de cada fatia de base64 nos chunks. */
+/** Máximo de fotos no campo photosInline do registro. */
+export const PHOTO_INLINE_MAX = 3;
+
+/** Tamanho aproximado de cada fatia de base64 nos chunks (secundário). */
 export const PHOTO_CHUNK_CHARS = 400000;
 
 const COMPRESS_STEPS = [
@@ -24,6 +27,8 @@ const COMPRESS_STEPS = [
   { maxEdge: 960, quality: 0.6 },
   { maxEdge: 720, quality: 0.55 },
   { maxEdge: 560, quality: 0.5 },
+  { maxEdge: 480, quality: 0.45 },
+  { maxEdge: 400, quality: 0.4 },
 ];
 
 function configLooksFilled() {
@@ -44,7 +49,7 @@ export function getSyncStatus() {
   }
   if (initError) return { mode: 'error', message: String(initError.message || initError) };
   if (!ready) return { mode: 'loading', message: 'Conectando Firebase…' };
-  return { mode: 'sync', message: 'Sincronização ativa (Firestore · fotos na nuvem)' };
+  return { mode: 'sync', message: 'Sincronização ativa (Firestore · fotos na mesma lista)' };
 }
 
 export async function initSync() {
@@ -203,7 +208,7 @@ function blobToRawBase64(blob) {
   });
 }
 
-function rawBase64ToBlob(b64, mime = 'image/jpeg') {
+export function rawBase64ToBlob(b64, mime = 'image/jpeg') {
   const bin = atob(String(b64 || ''));
   const arr = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
@@ -211,15 +216,15 @@ function rawBase64ToBlob(b64, mime = 'image/jpeg') {
 }
 
 /**
- * Loop agressivo: 1280@0.7 → 960@0.6 → 720@0.55 → 560@0.5
- * até base64.length <= PHOTO_BASE64_MAX (700 KiB).
+ * Loop agressivo: 1280@0.7 → … → 400@0.4 até base64.length <= maxChars (default 280 KiB).
  * @returns {{ ok: true, blob: Blob, base64: string } | { ok: false, blob: Blob, base64: string, reason: 'too_large' }}
  */
-export async function compressUntilFit(blob) {
+export async function compressUntilFit(blob, maxChars = PHOTO_BASE64_MAX) {
   if (!blob) return { ok: false, blob: null, base64: '', reason: 'too_large' };
+  const limit = Number(maxChars) > 0 ? Number(maxChars) : PHOTO_BASE64_MAX;
   let current = blob;
   let base64 = await blobToRawBase64(current);
-  if (base64.length <= PHOTO_BASE64_MAX) {
+  if (base64.length <= limit) {
     return { ok: true, blob: current, base64 };
   }
   for (const step of COMPRESS_STEPS) {
@@ -227,7 +232,7 @@ export async function compressUntilFit(blob) {
       const next = (await compressImageBlob(current, step)) || current;
       current = next;
       base64 = await blobToRawBase64(current);
-      if (base64.length <= PHOTO_BASE64_MAX) {
+      if (base64.length <= limit) {
         return { ok: true, blob: current, base64 };
       }
     } catch (err) {
@@ -235,6 +240,45 @@ export async function compressUntilFit(blob) {
     }
   }
   return { ok: false, blob: current, base64, reason: 'too_large' };
+}
+
+/**
+ * Constrói photosInline a partir de blobs locais (máx PHOTO_INLINE_MAX).
+ * Prefere pelo menos 1 capa: inclui as que couberem ≤ PHOTO_BASE64_MAX.
+ * @param {{ id: string, blob: Blob, createdAt?: string, kind?: string, mime?: string }[]} photos
+ * @returns {Promise<{ inline: object[], skipped: number, errors: string[] }>}
+ */
+export async function buildPhotosInline(photos) {
+  const inline = [];
+  let skipped = 0;
+  const errors = [];
+  const list = Array.isArray(photos) ? photos : [];
+  for (const p of list) {
+    if (inline.length >= PHOTO_INLINE_MAX) break;
+    if (!p?.blob) {
+      skipped += 1;
+      continue;
+    }
+    try {
+      const fitted = await compressUntilFit(p.blob, PHOTO_BASE64_MAX);
+      if (!fitted.ok || !fitted.base64) {
+        skipped += 1;
+        continue;
+      }
+      inline.push({
+        id: p.id || crypto.randomUUID(),
+        mime: 'image/jpeg',
+        dataBase64: fitted.base64,
+        createdAt: p.createdAt || new Date().toISOString(),
+        kind: p.kind || 'box',
+      });
+    } catch (err) {
+      skipped += 1;
+      errors.push(String(err?.message || err));
+      console.warn('buildPhotosInline:', err);
+    }
+  }
+  return { inline, skipped, errors };
 }
 
 function humanSyncError(err) {

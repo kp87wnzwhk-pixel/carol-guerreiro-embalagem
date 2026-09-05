@@ -1,15 +1,22 @@
 /* Service worker — cache estático para uso offline */
-const CACHE = 'cgi-pack-v7';
+const CACHE = 'cgi-pack-v8';
 const ASSETS = [
   './',
   './index.html',
   './css/styles.css',
+  './css/styles.css?v=8',
   './js/app.js',
+  './js/app.js?v=8',
   './js/config.js',
+  './js/config.js?v=8',
   './js/storage.js',
+  './js/storage.js?v=8',
   './js/db.js',
+  './js/db.js?v=8',
   './js/sync.js',
+  './js/sync.js?v=8',
   './js/firebase-config.js',
+  './js/firebase-config.js?v=8',
   './manifest.json',
   './icons/logo.svg',
   './icons/icon-192.png',
@@ -29,6 +36,12 @@ self.addEventListener('activate', (event) => {
       Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k)))
     ).then(() => self.clients.claim())
   );
+});
+
+self.addEventListener('message', (event) => {
+  if (event.data && event.data.type === 'SKIP_WAITING') {
+    self.skipWaiting();
+  }
 });
 
 self.addEventListener('fetch', (event) => {

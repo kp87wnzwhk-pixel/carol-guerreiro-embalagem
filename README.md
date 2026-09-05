@@ -10,7 +10,7 @@ App **estático** (PWA mobile-first) para registrar caixas embaladas no armazém
 - PIN da equipe (padrão temporário: **`2026`**)
 - Durabilidade local reforçada (espelho + auto-backups + download automático)
 - Backup JSON (exportar / importar)
-- Sincronização multi-aparelho via **Firestore** (registros **e fotos** — **sem** Firebase Storage / sem Blaze)
+- Sincronização multi-aparelho via **Firestore** (lista + fotos no mesmo documento — **sem** Firebase Storage / sem Blaze)
 
 ## Abrir localmente
 
@@ -86,41 +86,36 @@ Neste repositório a sync está **ativa** (`SYNC_ENABLED = true` + credenciais d
 2. Crie **Firestore Database** → escolha **start in test mode**
 3. Storage é **opcional** (não usado pelo happy path; pode ignorar)
 4. Se o assistente já fechou o modo teste, cole as regras abertas abaixo
-5. Coleção: `embalagens` · fotos: `embalagens/{recordId}/fotos/{photoId}`
+5. Coleção: `embalagens` · fotos principais no campo `photosInline` do doc (subcoleção `fotos/` é opcional/legado)
 
-### Fotos na nuvem (Firestore, em pedaços)
+### Fotos na nuvem (caminho principal: `photosInline` no documento)
 
-Metadados em `embalagens/{recordId}/fotos/{photoId}` **sem** o base64 completo (evita o limite de **1 MiB** por documento):
+Os metadados das caixas **já sincronizavam** bem entre celulares. O caminho confiável para fotos é o **mesmo documento** Firestore (`embalagens/{id}`), não a subcoleção:
 
-| Campo | Valor |
-|-------|--------|
-| `id` | id da foto |
-| `kind` | ex. `box` |
-| `createdAt` | ISO |
-| `mime` | `image/jpeg` |
-| `chunkCount` | nº de fatias |
-| `totalChars` | tamanho total do base64 |
+Campo no registro: **`photosInline`**: até **3** itens `{ id, mime, dataBase64, createdAt, kind }`.
 
-Chunks em `embalagens/{recordId}/fotos/{photoId}/chunks/{index}`:
+- Cada `dataBase64` ≤ **~280 KiB** (3 × 280 ≈ 840 KiB + campos &lt; limite 1 MiB do Firestore)
+- `photoCount` continua no registro
+- Ao **salvar** ou tocar **Enviar fotos para a nuvem**, o app comprime (canvas) e faz `setDoc` merge do registro com `photosInline`
+- No outro aparelho, o pull/subscribe lê `photosInline`, grava no IndexedDB (`hydrateInlinePhotos`) e mostra a galeria; se o IDB ainda estiver vazio, decodifica o base64 direto para a UI
 
-| Campo | Valor |
-|-------|--------|
-| `i` | índice (0…n-1) |
-| `data` | fatia de base64 (~400 000 caracteres) |
+**Compressão agressiva** (loop no canvas):
 
-Docs antigos com `dataBase64` inline ainda são lidos (compatibilidade).
+1. 1280@0.7 → 2. 960@0.6 → 3. 720@0.55 → 4. 560@0.5 → 5. **480@0.45** → 6. **400@0.4**  
+até cada base64 ≤ **280 KiB**. Prefere pelo menos **1 foto de capa** se só uma couber.
 
-**Compressão agressiva** antes do upload (loop no canvas):
+Se o upsert inline falhar, o toast mostra o **erro real** (permissão / tamanho / rede).
 
-1. 1280px @ 0.7 → 2. 960px @ 0.6 → 3. 720px @ 0.55 → 4. 560px @ 0.5  
-até o base64 ficar ≤ **~700 KB** (margem sob 1 MiB). Se ainda for grande demais → toast em português; a foto fica só no IndexedDB.
+**Secundário (opcional):** ainda tenta a subcoleção `embalagens/{id}/fotos/{photoId}` + `chunks/` (compatibilidade). O sucesso exigido é o **inline no registro**.
 
-Falhas de upload (permissão / tamanho / rede) mostram **toast**, não só `console.warn`.
+**iPhone / HEIC:** o canvas reencode para JPEG; se a foto não aparecer noutro telemóvel, abra o detalhe e toque **Enviar fotos para a nuvem** uma vez (rebuild do `photosInline`).
+
+Download automático JSON **leve** omite `photosInline` (só metadados / `photoCount`). O **backup completo com fotos** usa as fotos do IndexedDB.
 
 No **detalhe**:
 
-- Ao abrir, **sempre** hidrata da nuvem (`Buscando fotos na nuvem…`) antes de decidir “Sem fotos.”
-- Botão **Enviar fotos para a nuvem** reenvia todas as fotos locais do registro (compressão + chunks) — útil se outro aparelho ainda mostrar “Sem fotos.”
+- Ao abrir, hidrata da nuvem (`Buscando fotos na nuvem…`) antes de “Sem fotos.”
+- Botão **Enviar fotos para a nuvem** reconstrói `photosInline` a partir do IndexedDB local e faz upsert — toast `Fotos na nuvem: N`
 
 ### Regras sugeridas (teste / equipe pequena)
 
@@ -178,7 +173,7 @@ Cada registro tem um campo `workDate` (`YYYY-MM-DD`, data local do aparelho) —
 3. Abra `https://<usuario>.github.io/<repo>/`
 4. No celular: **Adicionar à tela inicial** (PWA)
 
-O service worker usa cache `cgi-pack-v7` — após deploy, feche e reabra o PWA (ou limpe só o cache do SW) para receber a atualização.
+O service worker usa cache `cgi-pack-v8` (scripts/CSS com `?v=8`). Após deploy o app tenta `skipWaiting` e mostra “Atualizando app…”. Se ficar preso, feche e reabra o PWA.
 
 ## Estrutura
 
@@ -189,10 +184,10 @@ js/app.js
 js/config.js          ← TEAM_PIN + STORAGE_KEYS
 js/storage.js         ← dual-write, auto-backups, recovery
 js/db.js              ← IndexedDB fotos
-js/sync.js            ← Firestore (registros + fotos em chunks)
+js/sync.js            ← Firestore (registros + photosInline; chunks secundário)
 js/firebase-config.js ← SYNC_ENABLED + credenciais
 manifest.json
-sw.js                 ← cache cgi-pack-v7
+sw.js                 ← cache cgi-pack-v8
 icons/
 README.md
 ```

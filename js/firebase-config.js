@@ -8,7 +8,7 @@
  * 4. Defina SYNC_ENABLED = true
  * 5. Regras sugeridas no README (com PIN no app, não no Firebase)
  *
- * Fotos: subcoleção Firestore embalagens/{id}/fotos (base64 comprimido).
+ * Fotos: campo photosInline[] no documento embalagens/{id} (caminho principal).
  * Não inicialize Analytics neste app estático.
  */
 export const SYNC_ENABLED = true;
