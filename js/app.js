@@ -147,12 +147,8 @@ function downloadMetadataBackup() {
 function afterSuccessfulSave() {
   const result = pushAutoBackup(records);
   const n = result?.n ?? listAutoBackups().length;
-  try {
-    downloadMetadataBackup();
-  } catch (err) {
-    console.warn('Auto-download backup:', err);
-  }
-  toast(`Salvo no aparelho ✓ · Backup automático #${n}`, 'ok', 4000);
+  // Backup automático silencioso (localStorage + espelho + nuvem). Sem download popup.
+  toast(`Salvo ✓ · Backup automático #${n}`, 'ok', 3500);
 }
 
 /* ---------- PIN ---------- */
