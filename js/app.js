@@ -68,6 +68,9 @@ let objectUrls = [];
 let pendingPhotoBlobs = []; // blobs ainda não gravados (formulário novo)
 let currentView = 'pin'; // pin | home | form | detail | settings | backup
 let editingId = null;
+let saveInProgress = false;
+let lastSaveStamp = 0; // debounce double-submit (ms)
+let lastSaveFingerprint = '';
 let detailId = null;
 let searchQuery = '';
 let dayFilter = 'all'; // 'all' | 'today' | 'tomorrow' — chips na home
@@ -902,6 +905,10 @@ function renderForm() {
           <button type="button" class="btn btn-secondary btn-lg" id="btn-cancel-form">Cancelar</button>
           <button type="submit" class="btn btn-primary btn-lg" id="btn-save">Salvar</button>
         </div>
+        ${editingId ? `
+        <div class="form-delete-block" style="margin-top:20px;padding-top:16px;border-top:1px solid var(--border, #e5e5e5)">
+          <button type="button" class="btn btn-danger btn-lg btn-block" id="btn-delete-form">Excluir contato</button>
+        </div>` : ''}
       </form>
     </div>
   `;
@@ -946,6 +953,14 @@ async function bindForm() {
   $('#pack-form')?.addEventListener('submit', async (e) => {
     e.preventDefault();
     await saveForm();
+  });
+
+  $('#btn-delete-form')?.addEventListener('click', async () => {
+    if (!editingId) return;
+    const rec = getRecord(editingId);
+    const label = rec?.clientName || 'este contato';
+    if (!confirm(`Excluir a caixa de ${label}? Esta ação não pode ser desfeita.`)) return;
+    await deleteContactRecord(editingId);
   });
 }
 
@@ -1004,10 +1019,23 @@ async function refreshPhotoPreview() {
 }
 
 async function saveForm() {
+  if (saveInProgress) return;
+
   const err = $('#form-error');
   const name = ($('#f-name')?.value || '').trim();
   const phoneRaw = ($('#f-phone')?.value || '').trim();
   const digits = phoneDigits(phoneRaw);
+  const workDateEarly =
+    parseWorkDate($('#f-work-date')?.value) || todayLocalISO();
+  const fingerprint = `${editingId || 'new'}|${name}|${digits}|${workDateEarly}`;
+  const nowMs = Date.now();
+  if (
+    fingerprint === lastSaveFingerprint &&
+    nowMs - lastSaveStamp < 2000
+  ) {
+    return; // ignore second submit within 2s for same form
+  }
+
   if (!name) {
     err.hidden = false;
     err.textContent = 'Informe o nome do cliente.';
@@ -1022,109 +1050,145 @@ async function saveForm() {
   }
   err.hidden = true;
 
-  const measureL = Number($('#f-l')?.value) || 0;
-  const measureW = Number($('#f-w')?.value) || 0;
-  const measureH = Number($('#f-h')?.value) || 0;
-  const kg = Number($('#f-kg')?.value) || 0;
-  const g = Math.min(999, Math.max(0, Math.floor(Number($('#f-g')?.value) || 0)));
-  const notes = ($('#f-notes')?.value || '').trim();
-  const createdBy = ($('#f-by')?.value || '').trim();
-  setSavedNickname(createdBy);
-  const workDate =
-    parseWorkDate($('#f-work-date')?.value) || todayLocalISO();
-
-  const now = new Date().toISOString();
-  let rec;
-  if (editingId) {
-    const existing = getRecord(editingId);
-    rec = normalizeRecord({
-      ...existing,
-      clientName: name,
-      phone: formatPhoneBR(phoneRaw),
-      measureL,
-      measureW,
-      measureH,
-      weightGrams: weightToGrams(kg, g),
-      notes,
-      createdBy,
-      workDate: workDate,
-      updatedAt: now,
-    });
-    records = records.map((r) => (r.id === editingId ? rec : r));
-  } else {
-    rec = normalizeRecord({
-      id: crypto.randomUUID(),
-      clientName: name,
-      phone: formatPhoneBR(phoneRaw),
-      measureL,
-      measureW,
-      measureH,
-      weightGrams: weightToGrams(kg, g),
-      notes,
-      createdBy,
-      workDate: workDate,
-      createdAt: now,
-      updatedAt: now,
-    });
-    records.push(rec);
+  saveInProgress = true;
+  const btnSave = $('#btn-save');
+  const prevSaveLabel = btnSave?.textContent || 'Salvar';
+  if (btnSave) {
+    btnSave.disabled = true;
+    btnSave.textContent = 'Salvando…';
   }
 
-  // Grava blobs locais (comprimidos) no IndexedDB primeiro
-  for (const rawBlob of pendingPhotoBlobs) {
-    let blob = rawBlob;
-    try {
-      const fitted = await compressUntilFit(rawBlob);
-      blob = fitted.blob || rawBlob;
-      if (!fitted.ok) {
+  try {
+    const measureL = Number($('#f-l')?.value) || 0;
+    const measureW = Number($('#f-w')?.value) || 0;
+    const measureH = Number($('#f-h')?.value) || 0;
+    const kg = Number($('#f-kg')?.value) || 0;
+    const g = Math.min(999, Math.max(0, Math.floor(Number($('#f-g')?.value) || 0)));
+    const notes = ($('#f-notes')?.value || '').trim();
+    const createdBy = ($('#f-by')?.value || '').trim();
+    setSavedNickname(createdBy);
+    const workDate = workDateEarly;
+
+    const now = new Date().toISOString();
+    let rec;
+    if (editingId) {
+      const existing = getRecord(editingId);
+      rec = normalizeRecord({
+        ...existing,
+        clientName: name,
+        phone: formatPhoneBR(phoneRaw),
+        measureL,
+        measureW,
+        measureH,
+        weightGrams: weightToGrams(kg, g),
+        notes,
+        createdBy,
+        workDate: workDate,
+        updatedAt: now,
+      });
+      records = records.map((r) => (r.id === editingId ? rec : r));
+    } else {
+      rec = normalizeRecord({
+        id: crypto.randomUUID(),
+        clientName: name,
+        phone: formatPhoneBR(phoneRaw),
+        measureL,
+        measureW,
+        measureH,
+        weightGrams: weightToGrams(kg, g),
+        notes,
+        createdBy,
+        workDate: workDate,
+        createdAt: now,
+        updatedAt: now,
+      });
+      records.push(rec);
+      // Immediate: overlapping second save updates this record instead of creating another UUID
+      editingId = rec.id;
+    }
+
+    // Grava blobs locais (comprimidos) no IndexedDB primeiro
+    for (const rawBlob of pendingPhotoBlobs) {
+      let blob = rawBlob;
+      try {
+        const fitted = await compressUntilFit(rawBlob);
+        blob = fitted.blob || rawBlob;
+        if (!fitted.ok) {
+          toast(
+            'Foto muito grande mesmo após comprimir — tentaremos na nuvem mesmo assim se couber 1 capa.',
+            '',
+            4500
+          );
+        }
+      } catch (e) {
+        console.warn('Compress foto:', e);
+        blob = rawBlob;
+      }
+      await addPhoto(rec.id, blob, {
+        createdAt: new Date().toISOString(),
+        kind: 'box',
+      });
+    }
+    pendingPhotoBlobs = [];
+
+    const photos = await listPhotosForRecord(rec.id);
+    rec.photoCount = photos.length;
+    records = records.map((r) => (r.id === rec.id ? rec : r));
+    persistLocal();
+
+    let inlineResult = { ok: true, count: 0 };
+    if (isSyncActive()) {
+      // Automático: após gravar no IDB, monta photosInline e faz upsert (sem botão)
+      inlineResult = await upsertRecordWithInlinePhotos(rec);
+      if (inlineResult.ok) {
+        if (inlineResult.count > 0) autoPhotoUploadAttempted.add(rec.id);
+      } else {
         toast(
-          'Foto muito grande mesmo após comprimir — tentaremos na nuvem mesmo assim se couber 1 capa.',
-          '',
-          4500
+          `Falha ao enviar fotos na nuvem: ${inlineResult.message || 'erro'}`,
+          'err',
+          6000
         );
       }
-    } catch (e) {
-      console.warn('Compress foto:', e);
-      blob = rawBlob;
+      if (inlineResult.ok && photos.length && inlineResult.count === 0) {
+        toast('Nenhuma foto coube no documento após comprimir.', 'err', 6000);
+      }
     }
-    await addPhoto(rec.id, blob, {
-      createdAt: new Date().toISOString(),
-      kind: 'box',
-    });
-  }
-  pendingPhotoBlobs = [];
 
-  const photos = await listPhotosForRecord(rec.id);
-  rec.photoCount = photos.length;
-  records = records.map((r) => (r.id === rec.id ? rec : r));
+    afterSuccessfulSave();
+    if (isSyncActive() && inlineResult.ok && inlineResult.count > 0) {
+      setTimeout(() => {
+        toast('Fotos na nuvem', 'ok', 2800);
+      }, 4200);
+    }
+    lastSaveFingerprint = `${rec.id}|${name}|${digits}|${workDate}`;
+    lastSaveStamp = Date.now();
+    detailId = rec.id;
+    editingId = null;
+    currentView = 'detail';
+    render();
+  } finally {
+    saveInProgress = false;
+    if (btnSave && document.body.contains(btnSave)) {
+      btnSave.disabled = false;
+      btnSave.textContent = prevSaveLabel;
+    }
+  }
+}
+
+async function deleteContactRecord(id) {
+  const r = getRecord(id);
+  if (!r) return;
+  await deleteAllPhotosForRecord(r.id);
+  records = records.filter((x) => x.id !== r.id);
   persistLocal();
-
-  let inlineResult = { ok: true, count: 0 };
-  if (isSyncActive()) {
-    // Automático: após gravar no IDB, monta photosInline e faz upsert (sem botão)
-    inlineResult = await upsertRecordWithInlinePhotos(rec);
-    if (inlineResult.ok) {
-      if (inlineResult.count > 0) autoPhotoUploadAttempted.add(rec.id);
-    } else {
-      toast(
-        `Falha ao enviar fotos na nuvem: ${inlineResult.message || 'erro'}`,
-        'err',
-        6000
-      );
-    }
-    if (inlineResult.ok && photos.length && inlineResult.count === 0) {
-      toast('Nenhuma foto coube no documento após comprimir.', 'err', 6000);
-    }
-  }
-
-  afterSuccessfulSave();
-  if (isSyncActive() && inlineResult.ok && inlineResult.count > 0) {
-    setTimeout(() => {
-      toast('Fotos na nuvem', 'ok', 2800);
-    }, 4200);
-  }
-  detailId = rec.id;
+  try {
+    if (isSyncActive()) await syncDeleteRecord(r.id);
+  } catch (_) {}
+  toast('Caixa excluída');
+  pendingPhotoBlobs = [];
+  detailId = null;
   editingId = null;
-  currentView = 'detail';
+  currentView = 'home';
   render();
 }
 
@@ -1180,7 +1244,9 @@ function renderDetailShell() {
         <div class="btn-row stacked">
           <a class="btn btn-whatsapp btn-lg btn-block" id="btn-wa" target="_blank" rel="noopener"
             href="${escapeAttr(waLink(r.phone, r.clientName))}">WhatsApp</a>
-          <button type="button" class="btn btn-danger btn-lg btn-block" id="btn-delete">Excluir</button>
+        </div>
+        <div class="detail-delete-block" style="margin-top:20px;padding-top:16px;border-top:1px solid var(--border, #e5e5e5)">
+          <button type="button" class="btn btn-danger btn-lg btn-block" id="btn-delete">Excluir contato</button>
         </div>
       </section>
     </div>
@@ -1201,16 +1267,7 @@ function bindDetail() {
 
   $('#btn-delete')?.addEventListener('click', async () => {
     if (!confirm(`Excluir a caixa de ${r.clientName}? Esta ação não pode ser desfeita.`)) return;
-    await deleteAllPhotosForRecord(r.id);
-    records = records.filter((x) => x.id !== r.id);
-    persistLocal();
-    try {
-      if (isSyncActive()) await syncDeleteRecord(r.id);
-    } catch (_) {}
-    toast('Caixa excluída');
-    detailId = null;
-    currentView = 'home';
-    render();
+    await deleteContactRecord(r.id);
   });
 
   $('#btn-move-today')?.addEventListener('click', () => moveRecordToDate(r.id, todayLocalISO()));
@@ -1680,7 +1737,7 @@ async function boot() {
         updateToastShown = true;
         toast('Atualizando app…', '', 3500);
       };
-      const reg = await navigator.serviceWorker.register('./sw.js?v=9');
+      const reg = await navigator.serviceWorker.register('./sw.js?v=11');
       if (navigator.serviceWorker.controller) {
         navigator.serviceWorker.controller.postMessage({ type: 'SKIP_WAITING' });
       }
