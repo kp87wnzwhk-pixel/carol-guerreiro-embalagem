@@ -56,7 +56,7 @@ import {
   syncUploadPhoto,
   syncDeletePhoto,
   syncPullPhotos,
-  compressImageBlob,
+  compressUntilFit,
   subscribeRecords,
 } from './sync.js';
 
@@ -201,7 +201,8 @@ async function maybePullRemote() {
  * Puxa fotos remotas (Firestore) e grava no IndexedDB se ainda não existirem.
  */
 async function hydratePhotosForRecord(recordId) {
-  if (!isSyncActive() || !recordId) return [];
+  if (!recordId) return [];
+  if (!isSyncActive()) return listPhotosForRecord(recordId);
   try {
     const remote = await syncPullPhotos(recordId);
     if (!remote.length) return listPhotosForRecord(recordId);
@@ -806,31 +807,54 @@ async function saveForm() {
     records.push(rec);
   }
 
+  let uploadFailCount = 0;
   for (const rawBlob of pendingPhotoBlobs) {
     let blob = rawBlob;
+    let tooLarge = false;
     try {
-      blob = (await compressImageBlob(rawBlob, { maxEdge: 1280, quality: 0.7 })) || rawBlob;
+      const fitted = await compressUntilFit(rawBlob);
+      blob = fitted.blob || rawBlob;
+      if (!fitted.ok) {
+        tooLarge = true;
+        uploadFailCount += 1;
+        toast(
+          'Foto ainda grande demais para a nuvem mesmo após comprimir. Ficou só neste aparelho.',
+          'err',
+          5500
+        );
+      }
     } catch (e) {
       console.warn('Compress foto:', e);
       blob = rawBlob;
     }
     const photoId = await addPhoto(rec.id, blob);
+    if (tooLarge) continue;
     try {
       if (isSyncActive()) {
         const result = await syncUploadPhoto(rec.id, photoId, blob, {
           createdAt: new Date().toISOString(),
           kind: 'box',
         });
-        if (result && result.ok === false && result.reason === 'too_large') {
+        if (result && result.ok === false) {
+          uploadFailCount += 1;
           toast(
-            'Foto ainda grande demais para a nuvem (>~900KB). Ficou só neste aparelho.',
+            result.message ||
+              (result.reason === 'too_large'
+                ? 'Foto ainda grande demais para a nuvem. Ficou só neste aparelho.'
+                : 'Falha ao enviar foto para a nuvem.'),
             'err',
-            5000
+            5500
           );
         }
       }
     } catch (e) {
+      uploadFailCount += 1;
       console.warn('Upload foto:', e);
+      toast(
+        `Falha ao enviar foto: ${e?.message || e || 'erro de rede/permissão'}`,
+        'err',
+        5500
+      );
     }
   }
   pendingPhotoBlobs = [];
@@ -844,9 +868,31 @@ async function saveForm() {
     if (isSyncActive()) await syncUpsertRecord(rec);
   } catch (e) {
     console.warn('Sync upsert:', e);
+    toast(`Falha ao sincronizar registro: ${e?.message || e}`, 'err', 5000);
+  }
+
+  let cloudPhotoWarn = false;
+  if (isSyncActive() && photos.length && uploadFailCount === 0) {
+    try {
+      const remote = await syncPullPhotos(rec.id);
+      if (!remote.length) cloudPhotoWarn = true;
+    } catch (_) {
+      cloudPhotoWarn = true;
+    }
+  } else if (isSyncActive() && photos.length && uploadFailCount > 0) {
+    cloudPhotoWarn = true;
   }
 
   afterSuccessfulSave();
+  if (cloudPhotoWarn) {
+    setTimeout(() => {
+      toast(
+        'Fotos podem não ter ido para a nuvem. No detalhe use “Enviar fotos para a nuvem”.',
+        'err',
+        6500
+      );
+    }, 4200);
+  }
   detailId = rec.id;
   editingId = null;
   currentView = 'detail';
@@ -883,7 +929,11 @@ function renderDetailShell() {
           ${r.createdBy ? `<div><dt>Por</dt><dd>${escapeHtml(r.createdBy)}</dd></div>` : ''}
           ${r.notes ? `<div class="full"><dt>Observações</dt><dd>${escapeHtml(r.notes)}</dd></div>` : ''}
         </dl>
-        <div class="photo-gallery" id="detail-photos"><p class="hint">Carregando fotos…</p></div>
+        <div class="photo-gallery" id="detail-photos"><p class="hint">Buscando fotos na nuvem…</p></div>
+        <button type="button" class="btn btn-secondary btn-sm btn-block" id="btn-reenviar-fotos" style="margin-top:10px;margin-bottom:4px">
+          Enviar fotos para a nuvem
+        </button>
+        <p class="hint" style="margin-top:0;margin-bottom:12px">Reenvia as fotos deste aparelho (comprimidas em pedaços) se outro celular mostrar “Sem fotos”.</p>
         <div class="move-day-block">
           <p class="card-title" style="margin-bottom:8px">Mover para outro dia</p>
           <div class="btn-row">
@@ -947,6 +997,8 @@ function bindDetail() {
     moveRecordToDate(r.id, picked);
   });
 
+  $('#btn-reenviar-fotos')?.addEventListener('click', () => reenviarFotosParaNuvem(r.id));
+
   loadDetailPhotos(r.id);
 }
 
@@ -981,42 +1033,84 @@ async function moveRecordToDate(id, workDate) {
   render();
 }
 
+function renderDetailPhotoGallery(host, photos) {
+  if (!host) return;
+  if (!photos.length) {
+    host.innerHTML = '<p class="hint">Sem fotos.</p>';
+    return;
+  }
+  host.innerHTML = photos
+    .map((p) => {
+      const url = trackUrl(photoObjectURL(p));
+      return `<a class="gallery-item" href="${url}" target="_blank" rel="noopener"><img src="${url}" alt="Foto da caixa" /></a>`;
+    })
+    .join('');
+}
+
 async function loadDetailPhotos(recordId) {
   const host = $('#detail-photos');
   if (!host) return;
   try {
-    let photos = await listPhotosForRecord(recordId);
-    // IndexedDB vazio (ou incompleto): puxar da subcoleção Firestore e hidratar
     if (isSyncActive()) {
-      if (!photos.length) {
-        photos = await hydratePhotosForRecord(recordId);
-      } else {
-        // Em background: buscar fotos novas de outros aparelhos
-        hydratePhotosForRecord(recordId).then((updated) => {
-          if (!updated?.length || updated.length === photos.length) return;
-          if (!$('#detail-photos') || detailId !== recordId) return;
-          const html = updated
-            .map((p) => {
-              const url = trackUrl(photoObjectURL(p));
-              return `<a class="gallery-item" href="${url}" target="_blank" rel="noopener"><img src="${url}" alt="Foto da caixa" /></a>`;
-            })
-            .join('');
-          $('#detail-photos').innerHTML = html;
-        });
-      }
-    }
-    if (photos.length) {
-      host.innerHTML = photos
-        .map((p) => {
-          const url = trackUrl(photoObjectURL(p));
-          return `<a class="gallery-item" href="${url}" target="_blank" rel="noopener"><img src="${url}" alt="Foto da caixa" /></a>`;
-        })
-        .join('');
+      host.innerHTML = '<p class="hint">Buscando fotos na nuvem…</p>';
+      const photos = await hydratePhotosForRecord(recordId);
+      if (!$('#detail-photos') || detailId !== recordId) return;
+      renderDetailPhotoGallery($('#detail-photos'), photos);
       return;
     }
-    host.innerHTML = '<p class="hint">Sem fotos.</p>';
+    const photos = await listPhotosForRecord(recordId);
+    if (!$('#detail-photos') || detailId !== recordId) return;
+    renderDetailPhotoGallery($('#detail-photos'), photos);
   } catch {
-    host.innerHTML = '<p class="hint err">Erro ao carregar fotos.</p>';
+    if ($('#detail-photos') && detailId === recordId) {
+      $('#detail-photos').innerHTML = '<p class="hint err">Erro ao carregar fotos.</p>';
+    }
+  }
+}
+
+/** Reenvia todas as fotos locais do registro para o Firestore (compressão + chunks). */
+async function reenviarFotosParaNuvem(recordId) {
+  if (!isSyncActive()) {
+    toast('Sincronização inativa. Ative o Firebase em firebase-config.js.', 'err');
+    return;
+  }
+  const photos = await listPhotosForRecord(recordId);
+  if (!photos.length) {
+    toast('Não há fotos locais neste aparelho para enviar.', 'err');
+    return;
+  }
+  toast(`Enviando ${photos.length} foto(s) para a nuvem…`, '', 4000);
+  let ok = 0;
+  let fail = 0;
+  for (let i = 0; i < photos.length; i++) {
+    const p = photos[i];
+    toast(`Enviando foto ${i + 1}/${photos.length}…`, '', 3500);
+    try {
+      const result = await syncUploadPhoto(recordId, p.id, p.blob, {
+        createdAt: p.createdAt,
+        kind: p.kind || 'box',
+      });
+      if (result && result.ok) {
+        ok += 1;
+      } else {
+        fail += 1;
+        toast(
+          result?.message ||
+            `Falha na foto ${i + 1}: ${result?.reason || 'erro'}`,
+          'err',
+          5000
+        );
+      }
+    } catch (e) {
+      fail += 1;
+      console.warn('reenviarFotos:', e);
+      toast(`Falha na foto ${i + 1}: ${e?.message || e}`, 'err', 5000);
+    }
+  }
+  if (fail === 0) {
+    toast(`Pronto: ${ok} foto(s) na nuvem ✓`, 'ok', 4500);
+  } else {
+    toast(`Enviadas ${ok}, falharam ${fail}. Tente de novo.`, 'err', 5500);
   }
 }
 

@@ -2,7 +2,8 @@
  * Camada de sincronização Firebase (opcional).
  * Com SYNC_ENABLED=false, todas as funções são no-ops / retornam local.
  *
- * Fotos: subcoleção Firestore embalagens/{id}/fotos/{photoId} (base64).
+ * Fotos: subcoleção Firestore embalagens/{id}/fotos/{photoId}
+ *   + chunks em embalagens/{id}/fotos/{photoId}/chunks/{i}
  * Firebase Storage NÃO é necessário (plano Spark / sem Blaze).
  */
 import { SYNC_ENABLED, firebaseConfig, FIRESTORE_COLLECTION, STORAGE_PATH_PREFIX } from './firebase-config.js';
@@ -12,8 +13,18 @@ let db = null;
 let ready = false;
 let initError = null;
 
-/** Limite aproximado do campo base64 (~900KB) — docs Firestore ≤ 1 MiB. */
-export const PHOTO_BASE64_MAX = 900 * 1024;
+/** Alvo de compressão (margem sob o limite 1 MiB do Firestore). */
+export const PHOTO_BASE64_MAX = 700 * 1024;
+
+/** Tamanho aproximado de cada fatia de base64 nos chunks. */
+export const PHOTO_CHUNK_CHARS = 400000;
+
+const COMPRESS_STEPS = [
+  { maxEdge: 1280, quality: 0.7 },
+  { maxEdge: 960, quality: 0.6 },
+  { maxEdge: 720, quality: 0.55 },
+  { maxEdge: 560, quality: 0.5 },
+];
 
 function configLooksFilled() {
   const c = firebaseConfig;
@@ -66,6 +77,21 @@ export async function syncUpsertRecord(record) {
   await setDoc(doc(db, FIRESTORE_COLLECTION, record.id), payload, { merge: true });
 }
 
+async function deletePhotoDocDeep(recordId, photoId) {
+  const { doc, deleteDoc, collection, getDocs } = await import(
+    'https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js'
+  );
+  try {
+    const chunksSnap = await getDocs(
+      collection(db, FIRESTORE_COLLECTION, recordId, 'fotos', photoId, 'chunks')
+    );
+    await Promise.all(chunksSnap.docs.map((d) => deleteDoc(d.ref)));
+  } catch (err) {
+    console.warn('Falha ao apagar chunks da foto:', err);
+  }
+  await deleteDoc(doc(db, FIRESTORE_COLLECTION, recordId, 'fotos', photoId));
+}
+
 export async function syncDeleteRecord(id) {
   if (!isSyncActive() || !id) return;
   const { doc, deleteDoc, collection, getDocs } = await import(
@@ -73,7 +99,16 @@ export async function syncDeleteRecord(id) {
   );
   try {
     const fotosSnap = await getDocs(collection(db, FIRESTORE_COLLECTION, id, 'fotos'));
-    await Promise.all(fotosSnap.docs.map((d) => deleteDoc(d.ref)));
+    for (const d of fotosSnap.docs) {
+      try {
+        await deletePhotoDocDeep(id, d.id);
+      } catch (err) {
+        console.warn('Falha ao apagar foto remota:', err);
+        try {
+          await deleteDoc(d.ref);
+        } catch (_) {}
+      }
+    }
   } catch (err) {
     console.warn('Falha ao apagar fotos remotas do registro:', err);
   }
@@ -176,66 +211,195 @@ function rawBase64ToBlob(b64, mime = 'image/jpeg') {
 }
 
 /**
- * Grava foto na subcoleção Firestore (não usa Storage).
- * @returns {{ ok: true } | { ok: false, reason: 'too_large' } | null}
+ * Loop agressivo: 1280@0.7 → 960@0.6 → 720@0.55 → 560@0.5
+ * até base64.length <= PHOTO_BASE64_MAX (700 KiB).
+ * @returns {{ ok: true, blob: Blob, base64: string } | { ok: false, blob: Blob, base64: string, reason: 'too_large' }}
+ */
+export async function compressUntilFit(blob) {
+  if (!blob) return { ok: false, blob: null, base64: '', reason: 'too_large' };
+  let current = blob;
+  let base64 = await blobToRawBase64(current);
+  if (base64.length <= PHOTO_BASE64_MAX) {
+    return { ok: true, blob: current, base64 };
+  }
+  for (const step of COMPRESS_STEPS) {
+    try {
+      const next = (await compressImageBlob(current, step)) || current;
+      current = next;
+      base64 = await blobToRawBase64(current);
+      if (base64.length <= PHOTO_BASE64_MAX) {
+        return { ok: true, blob: current, base64 };
+      }
+    } catch (err) {
+      console.warn('compressUntilFit step falhou:', step, err);
+    }
+  }
+  return { ok: false, blob: current, base64, reason: 'too_large' };
+}
+
+function humanSyncError(err) {
+  const code = err?.code || '';
+  const msg = String(err?.message || err || '');
+  if (code === 'permission-denied' || /permission/i.test(msg)) {
+    return 'Sem permissão no Firestore. Verifique as regras no Console Firebase.';
+  }
+  if (code === 'unavailable' || /network|offline|Failed to fetch/i.test(msg)) {
+    return 'Sem rede ou Firebase indisponível. Tente de novo.';
+  }
+  if (/exceeds|too large|size|1 MiB|1048576/i.test(msg)) {
+    return 'Foto ainda grande demais para a nuvem (limite Firestore).';
+  }
+  return msg.slice(0, 160) || 'Falha ao enviar foto para a nuvem.';
+}
+
+/**
+ * Grava foto na subcoleção Firestore em chunks (não usa Storage).
+ * Comprime agressivamente antes. Metadados sem base64 completo.
+ * @returns {{ ok: true, chunkCount: number } | { ok: false, reason: string, message?: string } | null}
  */
 export async function syncUploadPhoto(recordId, photoId, blob, meta = {}) {
   if (!isSyncActive() || !recordId || !photoId || !blob) return null;
-  const dataBase64 = await blobToRawBase64(blob);
-  if (dataBase64.length > PHOTO_BASE64_MAX) {
-    return { ok: false, reason: 'too_large' };
+
+  let fitted;
+  try {
+    fitted = await compressUntilFit(blob);
+  } catch (err) {
+    return { ok: false, reason: 'compress_error', message: humanSyncError(err) };
   }
-  const { doc, setDoc } = await import('https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js');
-  const payload = {
-    id: photoId,
-    kind: meta.kind || 'box',
-    createdAt: meta.createdAt || new Date().toISOString(),
-    mime: 'image/jpeg',
-    dataBase64,
-  };
-  await setDoc(doc(db, FIRESTORE_COLLECTION, recordId, 'fotos', photoId), payload, { merge: true });
-  return { ok: true };
+  if (!fitted.ok) {
+    return {
+      ok: false,
+      reason: 'too_large',
+      message:
+        'Foto ainda grande demais para a nuvem mesmo após comprimir. Ficou só neste aparelho. Use uma foto menor.',
+    };
+  }
+
+  const dataBase64 = fitted.base64;
+  const totalChars = dataBase64.length;
+  const chunkCount = Math.max(1, Math.ceil(totalChars / PHOTO_CHUNK_CHARS));
+
+  try {
+    const { doc, setDoc, collection, getDocs, deleteDoc } = await import(
+      'https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js'
+    );
+
+    // Limpar chunks antigos (reenvio / migração)
+    try {
+      const oldChunks = await getDocs(
+        collection(db, FIRESTORE_COLLECTION, recordId, 'fotos', photoId, 'chunks')
+      );
+      await Promise.all(oldChunks.docs.map((d) => deleteDoc(d.ref)));
+    } catch (_) {}
+
+    const payload = {
+      id: photoId,
+      kind: meta.kind || 'box',
+      createdAt: meta.createdAt || new Date().toISOString(),
+      mime: 'image/jpeg',
+      chunkCount,
+      totalChars,
+    };
+    // Sem dataBase64 no meta (chunked) — replace completo limpa legado inline
+    await setDoc(doc(db, FIRESTORE_COLLECTION, recordId, 'fotos', photoId), payload);
+
+    for (let i = 0; i < chunkCount; i++) {
+      const start = i * PHOTO_CHUNK_CHARS;
+      const slice = dataBase64.slice(start, start + PHOTO_CHUNK_CHARS);
+      await setDoc(
+        doc(db, FIRESTORE_COLLECTION, recordId, 'fotos', photoId, 'chunks', String(i)),
+        { i, data: slice }
+      );
+    }
+    return { ok: true, chunkCount };
+  } catch (err) {
+    console.warn('syncUploadPhoto:', err);
+    return { ok: false, reason: 'upload_error', message: humanSyncError(err) };
+  }
 }
 
 export async function syncDeletePhoto(recordId, photoId) {
   if (!isSyncActive() || !recordId || !photoId) return;
   try {
-    const { doc, deleteDoc } = await import('https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js');
-    await deleteDoc(doc(db, FIRESTORE_COLLECTION, recordId, 'fotos', photoId));
+    await deletePhotoDocDeep(recordId, photoId);
   } catch (err) {
     console.warn('Falha ao apagar foto no Firestore:', err);
+    throw err;
   }
 }
 
 /**
- * Lê embalagens/{recordId}/fotos e devolve { id, kind, createdAt, mime, blob }[].
+ * Lê embalagens/{recordId}/fotos (+ chunks) e devolve { id, kind, createdAt, mime, blob }[].
+ * Compatível com docs legados que ainda têm dataBase64 inline.
  */
 export async function syncPullPhotos(recordId) {
   if (!isSyncActive() || !recordId) return [];
   try {
-    const { collection, getDocs } = await import(
+    const { collection, getDocs, doc, getDoc } = await import(
       'https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js'
     );
     const snap = await getDocs(collection(db, FIRESTORE_COLLECTION, recordId, 'fotos'));
     const list = [];
-    snap.forEach((d) => {
+
+    for (const d of snap.docs) {
       const data = d.data() || {};
       const mime = data.mime || 'image/jpeg';
-      const b64 = data.dataBase64;
-      if (!b64) return;
+      const photoId = data.id || d.id;
+      let b64 = '';
+
+      if (data.dataBase64 && typeof data.dataBase64 === 'string') {
+        // Legado: base64 inline no documento
+        b64 = data.dataBase64;
+      } else {
+        const chunkCount = Number(data.chunkCount) || 0;
+        if (chunkCount > 0) {
+          const parts = new Array(chunkCount).fill('');
+          const chunksSnap = await getDocs(
+            collection(db, FIRESTORE_COLLECTION, recordId, 'fotos', photoId, 'chunks')
+          );
+          chunksSnap.forEach((cd) => {
+            const c = cd.data() || {};
+            const idx = Number(c.i ?? cd.id);
+            if (Number.isFinite(idx) && idx >= 0 && idx < chunkCount && typeof c.data === 'string') {
+              parts[idx] = c.data;
+            }
+          });
+          // Fallback: se faltou algum chunk, tentar getDoc individual
+          for (let i = 0; i < chunkCount; i++) {
+            if (parts[i]) continue;
+            try {
+              const cref = await getDoc(
+                doc(db, FIRESTORE_COLLECTION, recordId, 'fotos', photoId, 'chunks', String(i))
+              );
+              if (cref.exists()) {
+                const c = cref.data() || {};
+                if (typeof c.data === 'string') parts[i] = c.data;
+              }
+            } catch (_) {}
+          }
+          if (parts.some((p) => !p)) {
+            console.warn('syncPullPhotos: chunks incompletos para', photoId);
+            continue;
+          }
+          b64 = parts.join('');
+        }
+      }
+
+      if (!b64) continue;
       list.push({
-        id: data.id || d.id,
+        id: photoId,
         kind: data.kind || 'box',
         createdAt: data.createdAt || '',
         mime,
         blob: rawBase64ToBlob(b64, mime),
       });
-    });
+    }
+
     list.sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
     return list;
   } catch (err) {
     console.warn('syncPullPhotos:', err);
-    return [];
+    throw err;
   }
 }
 

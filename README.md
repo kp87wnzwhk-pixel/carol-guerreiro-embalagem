@@ -88,20 +88,39 @@ Neste repositório a sync está **ativa** (`SYNC_ENABLED = true` + credenciais d
 4. Se o assistente já fechou o modo teste, cole as regras abertas abaixo
 5. Coleção: `embalagens` · fotos: `embalagens/{recordId}/fotos/{photoId}`
 
-### Fotos na nuvem (Firestore)
+### Fotos na nuvem (Firestore, em pedaços)
+
+Metadados em `embalagens/{recordId}/fotos/{photoId}` **sem** o base64 completo (evita o limite de **1 MiB** por documento):
 
 | Campo | Valor |
 |-------|--------|
-| Caminho | `embalagens/{recordId}/fotos/{photoId}` |
 | `id` | id da foto |
 | `kind` | ex. `box` |
 | `createdAt` | ISO |
 | `mime` | `image/jpeg` |
-| `dataBase64` | base64 **cru** (sem prefixo `data:image/...;base64,`) |
+| `chunkCount` | nº de fatias |
+| `totalChars` | tamanho total do base64 |
 
-Antes do upload o app **redimensiona** no browser (canvas): aresta máxima **1280px**, JPEG qualidade **~0.7**. Se o base64 ainda passar de **~900KB**, o upload para a nuvem é **ignorado** (toast de aviso) — a foto fica só no IndexedDB deste aparelho. Limite de documento Firestore ≈ **1 MiB**.
+Chunks em `embalagens/{recordId}/fotos/{photoId}/chunks/{index}`:
 
-No detalhe: galeria lê IndexedDB primeiro; se vazio (ou para completar), puxa a subcoleção `fotos` e hidrata o IndexedDB.
+| Campo | Valor |
+|-------|--------|
+| `i` | índice (0…n-1) |
+| `data` | fatia de base64 (~400 000 caracteres) |
+
+Docs antigos com `dataBase64` inline ainda são lidos (compatibilidade).
+
+**Compressão agressiva** antes do upload (loop no canvas):
+
+1. 1280px @ 0.7 → 2. 960px @ 0.6 → 3. 720px @ 0.55 → 4. 560px @ 0.5  
+até o base64 ficar ≤ **~700 KB** (margem sob 1 MiB). Se ainda for grande demais → toast em português; a foto fica só no IndexedDB.
+
+Falhas de upload (permissão / tamanho / rede) mostram **toast**, não só `console.warn`.
+
+No **detalhe**:
+
+- Ao abrir, **sempre** hidrata da nuvem (`Buscando fotos na nuvem…`) antes de decidir “Sem fotos.”
+- Botão **Enviar fotos para a nuvem** reenvia todas as fotos locais do registro (compressão + chunks) — útil se outro aparelho ainda mostrar “Sem fotos.”
 
 ### Regras sugeridas (teste / equipe pequena)
 
@@ -119,6 +138,9 @@ service cloud.firestore {
       allow read, write: if true; // TROQUE por Auth em produção
       match /fotos/{photoId} {
         allow read, write: if true;
+        match /chunks/{chunkId} {
+          allow read, write: if true;
+        }
       }
     }
   }
@@ -156,7 +178,7 @@ Cada registro tem um campo `workDate` (`YYYY-MM-DD`, data local do aparelho) —
 3. Abra `https://<usuario>.github.io/<repo>/`
 4. No celular: **Adicionar à tela inicial** (PWA)
 
-O service worker usa cache `cgi-pack-v6` — após deploy, feche e reabra o PWA (ou limpe só o cache do SW) para receber a atualização.
+O service worker usa cache `cgi-pack-v7` — após deploy, feche e reabra o PWA (ou limpe só o cache do SW) para receber a atualização.
 
 ## Estrutura
 
@@ -167,10 +189,10 @@ js/app.js
 js/config.js          ← TEAM_PIN + STORAGE_KEYS
 js/storage.js         ← dual-write, auto-backups, recovery
 js/db.js              ← IndexedDB fotos
-js/sync.js            ← Firestore (registros + fotos base64)
+js/sync.js            ← Firestore (registros + fotos em chunks)
 js/firebase-config.js ← SYNC_ENABLED + credenciais
 manifest.json
-sw.js                 ← cache cgi-pack-v6
+sw.js                 ← cache cgi-pack-v7
 icons/
 README.md
 ```
