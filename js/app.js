@@ -883,8 +883,12 @@ function renderForm() {
           <textarea id="f-notes" rows="3" placeholder="Notas…">${escapeHtml(r?.notes || '')}</textarea>
         </div>
         <div class="form-row">
-          <label for="f-by">Quem registrou <span class="optional">(apelido)</span></label>
-          <input type="text" id="f-by" value="${escapeAttr(nick)}" placeholder="Seu nome / apelido" />
+          <label for="f-by">Quem registrou</label>
+          <select id="f-by" required>
+            <option value="" disabled ${!nick ? 'selected' : ''}>Escolha quem registrou</option>
+            <option value="Aprendiz Guilherme" ${nick === 'Aprendiz Guilherme' ? 'selected' : ''}>Aprendiz Guilherme</option>
+            <option value="Mestre Carlos 👑" ${nick === 'Mestre Carlos 👑' || nick === 'Mestre Carlos' ? 'selected' : ''}>Mestre Carlos 👑</option>
+          </select>
         </div>
         <div class="form-row">
           <span class="card-title" style="margin-bottom:8px;display:block">Fotos</span>
