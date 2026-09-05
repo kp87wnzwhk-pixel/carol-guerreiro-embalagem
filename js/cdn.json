@@ -1,0 +1,10 @@
+{
+  "local": "./vendor/tesseract.min.js",
+  "workerPath": "./vendor/worker.min.js",
+  "corePath": "./vendor/",
+  "langPath": "./vendor/",
+  "host": "cdn.jsdelivr.net",
+  "pkg": "tesseract",
+  "ver": "@5",
+  "file": "dist/tesseract.min.js"
+}

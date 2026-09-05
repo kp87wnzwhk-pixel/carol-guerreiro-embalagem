@@ -7,6 +7,7 @@ App **estático** (PWA mobile-first) para registrar caixas embaladas no armazém
 - Lista de caixas agrupada por **data da caixa** (Hoje / Amanhã / outros dias) com busca por nome/telefone
 - Mover caixas entre dias (hoje, amanhã ou data escolhida)
 - Medidas (C × L × A em cm), peso (kg + g), fotos, observações
+- **Preencher por foto** (OCR Tesseract): nome, medidas e peso a partir da etiqueta
 - PIN da equipe (padrão temporário: **`2026`**)
 - Durabilidade local reforçada (espelho + auto-backups + download automático)
 - Backup JSON (exportar / importar)
@@ -177,7 +178,7 @@ Cada registro tem um campo `workDate` (`YYYY-MM-DD`, data local do aparelho) —
 3. Abra `https://<usuario>.github.io/<repo>/`
 4. No celular: **Adicionar à tela inicial** (PWA)
 
-O service worker usa cache `cgi-pack-v15` (scripts/CSS com `?v=15`). Após deploy o app tenta `skipWaiting` e mostra “Atualizando app…”. Se ficar preso, feche e reabra o PWA.
+O service worker usa cache `cgi-pack-v16` (scripts/CSS com `?v=16`). Após deploy o app tenta `skipWaiting` e mostra “Atualizando app…”. Se ficar preso, feche e reabra o PWA.
 
 ## Estrutura
 
@@ -190,8 +191,11 @@ js/storage.js         ← dual-write, auto-backups, recovery
 js/db.js              ← IndexedDB fotos
 js/sync.js            ← Firestore (registros + photosInline; chunks secundário)
 js/firebase-config.js ← SYNC_ENABLED + credenciais
+js/ocr-fill.js        ← OCR autofill (nome/medidas/peso)
+js/cdn.json           ← Tesseract local/CDN
+vendor/               ← Tesseract.js offline
 manifest.json
-sw.js                 ← cache cgi-pack-v15
+sw.js                 ← cache cgi-pack-v16
 icons/
 README.md
 ```

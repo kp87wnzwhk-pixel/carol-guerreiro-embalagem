@@ -69,6 +69,7 @@ import {
   syncPullExcludedIds,
   subscribeExcluded,
 } from './sync.js';
+import { recognize as recognizeLabel } from './ocr-fill.js';
 
 let records = [];
 let objectUrls = [];
@@ -934,6 +935,23 @@ function renderForm() {
     <div class="screen form-screen">
       ${headerHtml({ showBack: true, compact: true, title: r ? 'Editar caixa' : 'Nova caixa' })}
       <form class="card form-card" id="pack-form" novalidate>
+        <div class="ocr-fill-block">
+          <button type="button" class="btn btn-primary btn-lg btn-block" id="btn-ocr-fill">
+            📷 Preencher por foto
+          </button>
+          <div class="btn-row ocr-pick-row" id="ocr-pick-row" hidden>
+            <label class="btn btn-secondary file-btn">
+              Câmera
+              <input type="file" id="ocr-cam" accept="image/*" capture="environment" hidden />
+            </label>
+            <label class="btn btn-outline file-btn">
+              Galeria
+              <input type="file" id="ocr-gal" accept="image/*" hidden />
+            </label>
+          </div>
+          <p class="hint ocr-status" id="ocr-status" role="status" hidden></p>
+          <div class="ocr-confirm card" id="ocr-confirm" hidden></div>
+        </div>
         <div class="form-row">
           <label for="f-name">Nome do cliente <span class="required">*</span></label>
           <input type="text" id="f-name" required autocomplete="name"
@@ -1073,6 +1091,147 @@ async function bindForm() {
     if (!confirm(`Excluir a caixa de ${label}? Esta ação não pode ser desfeita.`)) return;
     await deleteContactRecord(editingId);
   });
+
+  bindOcrFill();
+}
+
+function bindOcrFill() {
+  const pickRow = $('#ocr-pick-row');
+  const statusEl = $('#ocr-status');
+  const confirmEl = $('#ocr-confirm');
+  const cam = $('#ocr-cam');
+  const gal = $('#ocr-gal');
+
+  $('#btn-ocr-fill')?.addEventListener('click', () => {
+    if (!pickRow) return;
+    pickRow.hidden = !pickRow.hidden;
+  });
+
+  const onPick = async (e) => {
+    const file = e.target?.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    if (pickRow) pickRow.hidden = true;
+    if (confirmEl) {
+      confirmEl.hidden = true;
+      confirmEl.innerHTML = '';
+    }
+    if (statusEl) {
+      statusEl.hidden = false;
+      statusEl.textContent = 'Lendo foto…';
+      statusEl.classList.remove('err', 'ok');
+    }
+    try {
+      const parsed = await recognizeLabel(file, (msg) => {
+        if (statusEl) statusEl.textContent = msg || 'Lendo foto…';
+      });
+      showOcrConfirm(parsed);
+    } catch (err) {
+      console.warn('OCR fail', err);
+      if (statusEl) {
+        statusEl.hidden = true;
+      }
+      toast('Não foi possível ler a foto. Preencha manualmente.', 'err');
+    }
+  };
+
+  cam?.addEventListener('change', onPick);
+  gal?.addEventListener('change', onPick);
+}
+
+function formatOcrMeasures(parsed) {
+  if (parsed.l == null && parsed.w == null && parsed.h == null) return '—';
+  const a = parsed.l != null ? parsed.l : '?';
+  const b = parsed.w != null ? parsed.w : '?';
+  const c = parsed.h != null ? parsed.h : '?';
+  return `${a} × ${b} × ${c} cm`;
+}
+
+function formatOcrWeight(parsed) {
+  if (parsed.kg == null && parsed.g == null) return '—';
+  const kg = parsed.kg || 0;
+  const g = parsed.g || 0;
+  return `${kg} kg + ${g} g`;
+}
+
+function showOcrConfirm(parsed) {
+  const statusEl = $('#ocr-status');
+  const confirmEl = $('#ocr-confirm');
+  if (statusEl) {
+    const hasAny =
+      parsed.name ||
+      parsed.l != null ||
+      parsed.w != null ||
+      parsed.h != null ||
+      parsed.kg != null ||
+      parsed.g != null;
+    if (!hasAny) {
+      statusEl.hidden = true;
+      toast('OCR não encontrou dados. Preencha manualmente.', 'err');
+      return;
+    }
+    statusEl.hidden = false;
+    statusEl.textContent = 'Confira os dados detectados:';
+    statusEl.classList.remove('err');
+    statusEl.classList.add('ok');
+  }
+  if (!confirmEl) return;
+  confirmEl.hidden = false;
+  confirmEl.innerHTML = `
+    <p class="ocr-confirm-title">Dados detectados</p>
+    <ul class="ocr-confirm-list">
+      <li><strong>Nome:</strong> ${escapeHtml(parsed.name || '—')}</li>
+      <li><strong>Medidas:</strong> ${escapeHtml(formatOcrMeasures(parsed))}</li>
+      <li><strong>Peso:</strong> ${escapeHtml(formatOcrWeight(parsed))}</li>
+    </ul>
+    <div class="btn-row">
+      <button type="button" class="btn btn-secondary" id="ocr-cancel">Cancelar</button>
+      <button type="button" class="btn btn-primary" id="ocr-apply">Usar estes dados</button>
+    </div>
+  `;
+  $('#ocr-cancel')?.addEventListener('click', () => {
+    confirmEl.hidden = true;
+    confirmEl.innerHTML = '';
+    if (statusEl) statusEl.hidden = true;
+  });
+  $('#ocr-apply')?.addEventListener('click', () => {
+    applyOcrParsed(parsed);
+    confirmEl.hidden = true;
+    confirmEl.innerHTML = '';
+    if (statusEl) {
+      statusEl.hidden = false;
+      statusEl.textContent = 'Campos preenchidos — revise e salve.';
+      statusEl.classList.add('ok');
+    }
+    toast('Campos preenchidos pela foto', 'ok');
+  });
+}
+
+function applyOcrParsed(parsed) {
+  if (parsed.name) {
+    const el = $('#f-name');
+    if (el) el.value = parsed.name;
+  }
+  if (parsed.l != null) {
+    const el = $('#f-l');
+    if (el) el.value = String(parsed.l);
+  }
+  if (parsed.w != null) {
+    const el = $('#f-w');
+    if (el) el.value = String(parsed.w);
+  }
+  if (parsed.h != null) {
+    const el = $('#f-h');
+    if (el) el.value = String(parsed.h);
+  }
+  if (parsed.kg != null) {
+    const el = $('#f-kg');
+    if (el) el.value = String(parsed.kg);
+  }
+  if (parsed.g != null) {
+    const el = $('#f-g');
+    if (el) el.value = String(parsed.g);
+  }
 }
 
 async function onPhotosPicked(e) {
