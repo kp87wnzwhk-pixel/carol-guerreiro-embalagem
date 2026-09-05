@@ -12,7 +12,7 @@
   <link rel="manifest" href="manifest.json" />
   <link rel="icon" type="image/svg+xml" href="icons/logo.svg" />
   <link rel="apple-touch-icon" href="icons/apple-touch-icon.png" />
-  <link rel="stylesheet" href="css/styles.css?v=18" />
+  <link rel="stylesheet" href="css/styles.css?v=19" />
 </head>
 <body>
   <div id="app">
@@ -20,36 +20,69 @@
   </div>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <script>
-  // Se o módulo travar, não ficar eterno em Carregando…
+(function () {
+  var VER = '19';
+  var FLAG = 'cgi_pack_clean_' + VER;
+
+  function hardClean(thenReload) {
+    var done = Promise.resolve();
+    if (navigator.serviceWorker) {
+      done = navigator.serviceWorker.getRegistrations().then(function (regs) {
+        return Promise.all(regs.map(function (r) { return r.unregister(); }));
+      });
+    }
+    return done.then(function () {
+      if (!window.caches) return;
+      return caches.keys().then(function (keys) {
+        return Promise.all(keys.map(function (k) { return caches.delete(k); }));
+      });
+    }).catch(function () {}).then(function () {
+      if (thenReload) {
+        try { localStorage.setItem(FLAG, '1'); } catch (e) {}
+        location.replace('./?v=' + VER + '&nocache=' + Date.now());
+      }
+    });
+  }
+
+  function showRescue(msg) {
+    var app = document.getElementById('app');
+    if (!app) return;
+    app.innerHTML = '<div class="screen" style="padding:24px;font-family:system-ui">'
+      + '<h1 style="color:#c2185b">Carol Embalagem</h1>'
+      + '<p>' + msg + '</p>'
+      + '<p><button id="btn-hard-reload" style="font-size:18px;padding:12px 18px;background:#e91e8c;color:#fff;border:0;border-radius:10px">Recarregar limpo</button></p>'
+      + '</div>';
+    var btn = document.getElementById('btn-hard-reload');
+    if (btn) btn.onclick = function () { hardClean(true); };
+  }
+
+  function loadApp() {
+    var s = document.createElement('script');
+    s.type = 'module';
+    s.src = 'js/app.js?v=' + VER + '&t=' + Date.now();
+    s.onerror = function () {
+      showRescue('Falha ao baixar o app. Toque para limpar o cache e tentar de novo.');
+    };
+    document.body.appendChild(s);
+  }
+
+  try {
+    if (localStorage.getItem(FLAG) !== '1') {
+      hardClean(true);
+      return;
+    }
+  } catch (e) {}
+
+  loadApp();
+
   setTimeout(function () {
     var app = document.getElementById('app');
     if (!app) return;
     if (app.querySelector('.empty-state') && /Carregando/.test(app.textContent || '')) {
-      app.innerHTML = '<div class="screen" style="padding:24px;font-family:system-ui">'
-        + '<h1 style="color:#c2185b">Carol Embalagem</h1>'
-        + '<p>A página demorou a carregar (cache antigo).</p>'
-        + '<p><button id="btn-hard-reload" style="font-size:18px;padding:12px 18px;background:#e91e8c;color:#fff;border:0;border-radius:10px">Recarregar limpo</button></p>'
-        + '</div>';
-      document.getElementById('btn-hard-reload').onclick = function () {
-        if (navigator.serviceWorker) {
-          navigator.serviceWorker.getRegistrations().then(function (regs) {
-            return Promise.all(regs.map(function (r) { return r.unregister(); }));
-          }).then(function () {
-            if (window.caches) {
-              return caches.keys().then(function (keys) {
-                return Promise.all(keys.map(function (k) { return caches.delete(k); }));
-              });
-            }
-          }).finally(function () {
-            location.href = './?v=18&nocache=' + Date.now();
-          });
-        } else {
-          location.href = './?v=18&nocache=' + Date.now();
-        }
-      };
+      showRescue('Ainda carregando… toque para limpar o cache e abrir.');
     }
-  }, 6000);
-</script>
-  <script type="module" src="js/app.js?v=18"></script>
+  }, 12000);
+})();
+  </script>
 </body>
 </html>

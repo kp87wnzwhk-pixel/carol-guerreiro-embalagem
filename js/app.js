@@ -69,12 +69,19 @@ import {
   syncPullExcludedIds,
   subscribeExcluded,
 } from './sync.js';
-import {
-  recognize as recognizeLabel,
-  parseMeasures,
-  parseWeight,
-  NAME_SCORE_MIN,
-} from './ocr-fill.js';
+let recognizeLabel = null;
+let parseMeasures = null;
+let parseWeight = null;
+let NAME_SCORE_MIN = 0.35;
+
+async function ensureOcr() {
+  if (recognizeLabel) return;
+  const mod = await import('./ocr-fill.js?v=19');
+  recognizeLabel = mod.recognize;
+  parseMeasures = mod.parseMeasures;
+  parseWeight = mod.parseWeight;
+  NAME_SCORE_MIN = mod.NAME_SCORE_MIN;
+}
 
 let records = [];
 let objectUrls = [];
@@ -1127,6 +1134,7 @@ function bindOcrFill() {
       statusEl.classList.remove('err', 'ok');
     }
     try {
+      await ensureOcr();
       const parsed = await recognizeLabel(file, (msg) => {
         if (statusEl) statusEl.textContent = msg || 'Lendo foto…';
       });
@@ -2248,12 +2256,15 @@ function migrateRegistrarNames() {
 }
 
 async function boot() {
-  records = loadRecords();
-  // Descarta locais já tombstoned (ex.: apagados noutro aparelho nesta sessão anterior)
-  getDeletedIds(); // init cache
-  purgeLocalTombstoned();
-  recoveryBanner = peekRecoveryBanner();
-  // Render PIN/UI first — never wait on Firebase/network for first paint
+  try {
+    records = loadRecords();
+    getDeletedIds();
+    purgeLocalTombstoned();
+    recoveryBanner = peekRecoveryBanner();
+  } catch (err) {
+    console.warn('boot local:', err);
+    records = records || [];
+  }
   render();
 
   let cloudSlow = false;
@@ -2292,34 +2303,17 @@ async function boot() {
   // Após pull: caixas antigas com fotos só no IDB sobem sozinhas (concorrência 2)
   queueBootPhotoBackfill(2).catch((e) => console.warn('boot photo backfill:', e));
 
+  // Service worker DESLIGADO na v19 (cache antigo travava no Carregando…)
   if ('serviceWorker' in navigator) {
     try {
-      let updateToastShown = false;
-      const showUpdatingOnce = () => {
-        if (updateToastShown) return;
-        updateToastShown = true;
-        toast('Atualizando app…', '', 3500);
-      };
-      const reg = await navigator.serviceWorker.register('./sw.js?v=18');
-      if (navigator.serviceWorker.controller) {
-        navigator.serviceWorker.controller.postMessage({ type: 'SKIP_WAITING' });
+      const regs = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(regs.map((r) => r.unregister()));
+      if (window.caches) {
+        const keys = await caches.keys();
+        await Promise.all(keys.map((k) => caches.delete(k)));
       }
-      if (reg.waiting) {
-        showUpdatingOnce();
-        reg.waiting.postMessage({ type: 'SKIP_WAITING' });
-      }
-      reg.addEventListener('updatefound', () => {
-        const nw = reg.installing;
-        if (!nw) return;
-        nw.addEventListener('statechange', () => {
-          if (nw.state === 'installed' && navigator.serviceWorker.controller) {
-            showUpdatingOnce();
-            nw.postMessage({ type: 'SKIP_WAITING' });
-          }
-        });
-      });
     } catch (err) {
-      console.warn('SW:', err);
+      console.warn('SW cleanup:', err);
     }
   }
 }
