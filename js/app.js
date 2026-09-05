@@ -36,6 +36,10 @@ import {
   formatWorkDateBR,
   formatWorkDateSectionTitle,
   groupRecordsByWorkDate,
+  isTombstoned,
+  addTombstone,
+  absorbTombstoneIds,
+  getDeletedIds,
 } from './storage.js';
 import {
   addPhoto,
@@ -61,6 +65,9 @@ import {
   rawBase64ToBlob,
   PHOTO_INLINE_MAX,
   subscribeRecords,
+  syncMarkExcluded,
+  syncPullExcludedIds,
+  subscribeExcluded,
 } from './sync.js';
 
 let records = [];
@@ -204,12 +211,29 @@ function mergeRemoteIntoLocal(remote) {
   if (!Array.isArray(remote)) return false;
   const map = new Map(records.map((r) => [r.id, r]));
   let changed = false;
+  const resurrected = [];
   for (const r of remote) {
     const n = normalizeRecord(r);
     if (!n) continue;
+    if (isTombstoned(n.id)) {
+      // Não ressuscitar: remove local se presente; re-apaga remoto (best-effort)
+      if (map.has(n.id)) {
+        map.delete(n.id);
+        changed = true;
+      }
+      resurrected.push(n.id);
+      continue;
+    }
     const local = map.get(n.id);
     if (!local || String(n.updatedAt) > String(local.updatedAt)) {
       map.set(n.id, n);
+      changed = true;
+    }
+  }
+  // Também remove locais tombstoned mesmo se não vierem no remote
+  for (const id of [...map.keys()]) {
+    if (isTombstoned(id)) {
+      map.delete(id);
       changed = true;
     }
   }
@@ -217,8 +241,12 @@ function mergeRemoteIntoLocal(remote) {
     records = [...map.values()];
     persistLocal();
   }
+  for (const id of resurrected) {
+    syncDeleteRecord(id).catch(() => {});
+  }
   // photosInline não vai ao localStorage (normalize); reanexa em memória e hidrata IDB
-  const inlineById = attachInlineFromRemote(remote);
+  const aliveRemote = (remote || []).filter((r) => r?.id && !isTombstoned(r.id));
+  const inlineById = attachInlineFromRemote(aliveRemote);
   for (const [id, photosInline] of inlineById) {
     hydrateInlinePhotos({ id, photosInline }).catch((err) =>
       console.warn('hydrateInlinePhotos:', err)
@@ -230,12 +258,31 @@ function mergeRemoteIntoLocal(remote) {
 async function maybePullRemote() {
   if (!isSyncActive()) return;
   try {
+    // Tombstones remotos primeiro — evita ressuscitar na merge
+    try {
+      const excluded = await syncPullExcludedIds();
+      absorbTombstoneIds(excluded);
+    } catch (err) {
+      console.warn('Pull excluidos falhou:', err);
+    }
+    purgeLocalTombstoned();
     const remote = await syncPullAll();
     if (!remote) return;
     mergeRemoteIntoLocal(remote);
   } catch (err) {
     console.warn('Pull remoto falhou:', err);
   }
+}
+
+/** Remove registros locais cujo id está em tombstones. @returns {boolean} */
+function purgeLocalTombstoned() {
+  const before = records.length;
+  records = records.filter((r) => r?.id && !isTombstoned(r.id));
+  if (records.length !== before) {
+    persistLocal();
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -331,6 +378,9 @@ function galleryFromInline(photosInline) {
  */
 async function upsertRecordWithInlinePhotos(rec) {
   if (!rec?.id) return { ok: false, count: 0, message: 'Registro inválido' };
+  if (isTombstoned(rec.id)) {
+    return { ok: false, count: 0, message: 'Contato excluído — não sincroniza' };
+  }
   const localPhotos = await listPhotosForRecord(rec.id);
   const { inline, skipped } = await buildPhotosInline(localPhotos);
   const now = new Date().toISOString();
@@ -399,6 +449,7 @@ function inlinePhotoCount(rec) {
 
 async function recordNeedsPhotoCloudUpload(recordId) {
   if (!recordId || !isSyncActive()) return false;
+  if (isTombstoned(recordId)) return false;
   const rec = getRecord(recordId);
   if (!rec) return false;
   let localPhotos;
@@ -421,6 +472,7 @@ async function autoUploadPhotosForRecord(recordId, opts = {}) {
   const toastProgress = !!opts.toastProgress;
   const force = !!opts.force;
   if (!recordId || !isSyncActive()) return { ok: false, skipped: true };
+  if (isTombstoned(recordId)) return { ok: false, skipped: true, reason: 'tombstoned' };
 
   if (autoPhotoUploadInFlight.has(recordId)) {
     return autoPhotoUploadInFlight.get(recordId);
@@ -481,6 +533,7 @@ async function queueBootPhotoBackfill(concurrency = 2) {
   const candidates = [];
   for (const r of records) {
     if (!r?.id) continue;
+    if (isTombstoned(r.id)) continue;
     if (autoPhotoUploadAttempted.has(r.id) || autoPhotoUploadInFlight.has(r.id)) continue;
     try {
       if (await recordNeedsPhotoCloudUpload(r.id)) candidates.push(r.id);
@@ -503,11 +556,29 @@ async function queueBootPhotoBackfill(concurrency = 2) {
 }
 
 let unsubRecords = null;
+let unsubExcluded = null;
+
+function applyExcludedIds(ids) {
+  absorbTombstoneIds(ids);
+  const purged = purgeLocalTombstoned();
+  if (detailId && isTombstoned(detailId)) {
+    detailId = null;
+    if (currentView === 'detail') currentView = 'home';
+  }
+  if (editingId && isTombstoned(editingId)) {
+    editingId = null;
+  }
+  return purged;
+}
 
 function startRealtimeSync() {
   if (unsubRecords) {
     try { unsubRecords(); } catch (_) {}
     unsubRecords = null;
+  }
+  if (unsubExcluded) {
+    try { unsubExcluded(); } catch (_) {}
+    unsubExcluded = null;
   }
   if (!isSyncActive()) return;
   unsubRecords = subscribeRecords((remote) => {
@@ -520,6 +591,14 @@ function startRealtimeSync() {
       render();
       return;
     }
+    if (currentView === 'home' || currentView === 'detail') {
+      render();
+    }
+  });
+  unsubExcluded = subscribeExcluded((ids) => {
+    const changed = applyExcludedIds(ids);
+    if (!changed) return;
+    if (currentView === 'form') return;
     if (currentView === 'home' || currentView === 'detail') {
       render();
     }
@@ -1200,21 +1279,81 @@ async function saveForm() {
   }
 }
 
-async function deleteContactRecord(id) {
-  const r = getRecord(id);
-  if (!r) return;
-  await deleteAllPhotosForRecord(r.id);
-  records = records.filter((x) => x.id !== r.id);
-  persistLocal();
+/**
+ * Tombstone + purge local + Firestore embalagens + excluidos/{id}.
+ * @param {string} id
+ * @param {{ silent?: boolean, navigateHome?: boolean }} [opts]
+ */
+async function deleteContactRecord(id, opts = {}) {
+  const silent = !!opts.silent;
+  const navigateHome = opts.navigateHome !== false;
+  const rid = String(id || '');
+  if (!rid) return;
+
+  addTombstone(rid);
+
+  const r = getRecord(rid);
   try {
-    if (isSyncActive()) await syncDeleteRecord(r.id);
+    await deleteAllPhotosForRecord(rid);
   } catch (_) {}
-  toast('Caixa excluída');
-  pendingPhotoBlobs = [];
-  detailId = null;
-  editingId = null;
-  currentView = 'home';
-  render();
+
+  records = records.filter((x) => x.id !== rid);
+  persistLocal();
+
+  try {
+    if (isSyncActive()) {
+      try {
+        await syncMarkExcluded(rid);
+      } catch (err) {
+        console.warn('syncMarkExcluded:', err);
+      }
+      try {
+        await syncDeleteRecord(rid);
+      } catch (err) {
+        console.warn('syncDeleteRecord:', err);
+      }
+    }
+  } catch (_) {}
+
+  if (!silent) {
+    toast('Contato excluído — não volta mais');
+  }
+  if (navigateHome) {
+    pendingPhotoBlobs = [];
+    detailId = null;
+    editingId = null;
+    currentView = 'home';
+    render();
+  }
+}
+
+/**
+ * Após sync: mantém só 1 Vanessa (mais recente por updatedAt/createdAt);
+ * tombstone+delete as demais.
+ */
+async function collapseVanessaDuplicates() {
+  const matches = records.filter((r) =>
+    /vanessa/i.test(String(r?.clientName || '').trim())
+  );
+  if (matches.length <= 1) return 0;
+
+  matches.sort((a, b) => {
+    const ta = String(a.updatedAt || a.createdAt || '');
+    const tb = String(b.updatedAt || b.createdAt || '');
+    return tb.localeCompare(ta);
+  });
+  const keep = matches[0];
+  const dupes = matches.slice(1);
+  console.info(
+    'collapseVanessaDuplicates: keeping',
+    keep.id,
+    'removing',
+    dupes.map((d) => d.id)
+  );
+  for (const d of dupes) {
+    await deleteContactRecord(d.id, { silent: true, navigateHome: false });
+  }
+  return dupes.length;
 }
 
 /* ---------- Detail ---------- */
@@ -1334,7 +1473,7 @@ async function moveRecordToDate(id, workDate) {
   records = records.map((x) => (x.id === id ? rec : x));
   persistLocal();
   try {
-    if (isSyncActive()) await syncUpsertRecord(rec);
+    if (isSyncActive() && !isTombstoned(rec.id)) await syncUpsertRecord(rec);
   } catch (e) {
     console.warn('Sync upsert:', e);
   }
@@ -1697,6 +1836,7 @@ async function doImport(e) {
     for (const raw of arr) {
       const n = normalizeRecord(raw);
       if (!n || !n.clientName) continue;
+      if (isTombstoned(n.id)) continue; // não ressuscitar excluídos
       const local = map.get(n.id);
       if (!local) {
         map.set(n.id, n);
@@ -1715,7 +1855,7 @@ async function doImport(e) {
         }
       }
       try {
-        if (isSyncActive()) await syncUpsertRecord(map.get(n.id));
+        if (isSyncActive() && !isTombstoned(n.id)) await syncUpsertRecord(map.get(n.id));
       } catch (_) {}
     }
     records = [...map.values()];
@@ -1765,7 +1905,7 @@ function migrateRegistrarNames() {
     if (isSyncActive()) {
       for (const r of records) {
         if (!r?.id) continue;
-        syncUpsertRecord(r).catch(() => {});
+        if (!isTombstoned(r.id)) syncUpsertRecord(r).catch(() => {});
       }
     }
   }
@@ -1775,10 +1915,21 @@ function migrateRegistrarNames() {
 
 async function boot() {
   records = loadRecords();
+  // Descarta locais já tombstoned (ex.: apagados noutro aparelho nesta sessão anterior)
+  getDeletedIds(); // init cache
+  purgeLocalTombstoned();
   recoveryBanner = peekRecoveryBanner();
   await initSync();
   migrateRegistrarNames();
   await maybePullRemote();
+  try {
+    const n = await collapseVanessaDuplicates();
+    if (n > 0) {
+      console.info('Vanessa duplicates collapsed:', n);
+    }
+  } catch (err) {
+    console.warn('collapseVanessaDuplicates:', err);
+  }
   startRealtimeSync();
   render();
 
@@ -1793,7 +1944,7 @@ async function boot() {
         updateToastShown = true;
         toast('Atualizando app…', '', 3500);
       };
-      const reg = await navigator.serviceWorker.register('./sw.js?v=11');
+      const reg = await navigator.serviceWorker.register('./sw.js?v=14');
       if (navigator.serviceWorker.controller) {
         navigator.serviceWorker.controller.postMessage({ type: 'SKIP_WAITING' });
       }

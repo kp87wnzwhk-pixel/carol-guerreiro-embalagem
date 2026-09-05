@@ -86,7 +86,7 @@ Neste repositório a sync está **ativa** (`SYNC_ENABLED = true` + credenciais d
 2. Crie **Firestore Database** → escolha **start in test mode**
 3. Storage é **opcional** (não usado pelo happy path; pode ignorar)
 4. Se o assistente já fechou o modo teste, cole as regras abertas abaixo
-5. Coleção: `embalagens` · fotos principais no campo `photosInline` do doc (subcoleção `fotos/` é opcional/legado)
+5. Coleções: `embalagens` (caixas) e `excluidos` (tombstones de ids apagados) · fotos no campo `photosInline` (subcoleção `fotos/` opcional/legado)
 
 ### Fotos na nuvem (caminho principal: `photosInline` no documento)
 
@@ -124,7 +124,7 @@ No **detalhe**:
 
 O app usa PIN no cliente — **não** substitui autenticação Firebase. Para produção, prefira Auth + regras por usuário. Em teste rápido (só equipe interna), cole:
 
-**Firestore** (inclui subcoleção `fotos`)
+**Firestore** (inclui subcoleção `fotos` + `excluidos` para deletes permanentes)
 
 ```
 rules_version = '2';
@@ -138,6 +138,9 @@ service cloud.firestore {
           allow read, write: if true;
         }
       }
+    }
+    match /excluidos/{doc} {
+      allow read, write: if true; // tombstones — ids apagados não voltam
     }
   }
 }
@@ -174,7 +177,7 @@ Cada registro tem um campo `workDate` (`YYYY-MM-DD`, data local do aparelho) —
 3. Abra `https://<usuario>.github.io/<repo>/`
 4. No celular: **Adicionar à tela inicial** (PWA)
 
-O service worker usa cache `cgi-pack-v11` (scripts/CSS com `?v=11`). Após deploy o app tenta `skipWaiting` e mostra “Atualizando app…”. Se ficar preso, feche e reabra o PWA.
+O service worker usa cache `cgi-pack-v14` (scripts/CSS com `?v=14`). Após deploy o app tenta `skipWaiting` e mostra “Atualizando app…”. Se ficar preso, feche e reabra o PWA.
 
 ## Estrutura
 
@@ -188,7 +191,7 @@ js/db.js              ← IndexedDB fotos
 js/sync.js            ← Firestore (registros + photosInline; chunks secundário)
 js/firebase-config.js ← SYNC_ENABLED + credenciais
 manifest.json
-sw.js                 ← cache cgi-pack-v11
+sw.js                 ← cache cgi-pack-v14
 icons/
 README.md
 ```

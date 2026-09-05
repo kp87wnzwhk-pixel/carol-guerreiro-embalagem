@@ -571,3 +571,67 @@ export function setSavedNickname(name) {
     localStorage.setItem(STORAGE_KEYS.nickname, String(name || '').trim());
   } catch (_) {}
 }
+
+/* ---------- Tombstones (deleted contact ids) ---------- */
+/** In-memory Set mirrored to localStorage STORAGE_KEYS.deleted */
+let deletedIdsCache = null;
+
+function loadDeletedIdsSet() {
+  if (deletedIdsCache) return deletedIdsCache;
+  try {
+    const raw = localStorage.getItem(STORAGE_KEYS.deleted);
+    if (!raw) {
+      deletedIdsCache = new Set();
+    } else {
+      const arr = JSON.parse(raw);
+      deletedIdsCache = new Set(
+        Array.isArray(arr) ? arr.map((id) => String(id)).filter(Boolean) : []
+      );
+    }
+  } catch {
+    deletedIdsCache = new Set();
+  }
+  return deletedIdsCache;
+}
+
+function persistDeletedIdsSet() {
+  const set = loadDeletedIdsSet();
+  try {
+    localStorage.setItem(STORAGE_KEYS.deleted, JSON.stringify([...set]));
+  } catch (err) {
+    console.warn('Falha ao gravar tombstones:', err);
+  }
+}
+
+/** @returns {Set<string>} */
+export function getDeletedIds() {
+  return loadDeletedIdsSet();
+}
+
+export function isTombstoned(id) {
+  if (!id) return false;
+  return loadDeletedIdsSet().has(String(id));
+}
+
+export function addTombstone(id) {
+  if (!id) return false;
+  const set = loadDeletedIdsSet();
+  const key = String(id);
+  if (set.has(key)) return false;
+  set.add(key);
+  persistDeletedIdsSet();
+  return true;
+}
+
+/** Merge remote excluded ids into local tombstones. @returns {number} newly added */
+export function absorbTombstoneIds(ids) {
+  let n = 0;
+  for (const id of ids || []) {
+    if (addTombstone(id)) n += 1;
+  }
+  return n;
+}
+
+export function listTombstoneIds() {
+  return [...loadDeletedIdsSet()];
+}

@@ -7,6 +7,10 @@
  * Firebase Storage NÃO é necessário (plano Spark / sem Blaze).
  */
 import { SYNC_ENABLED, firebaseConfig, FIRESTORE_COLLECTION, STORAGE_PATH_PREFIX } from './firebase-config.js';
+import { isTombstoned, addTombstone } from './storage.js';
+
+/** Coleção Firestore de tombstones (doc id = recordId). */
+export const FIRESTORE_EXCLUIDOS = 'excluidos';
 
 let app = null;
 let db = null;
@@ -73,13 +77,28 @@ export async function initSync() {
   }
 }
 
-/** Upsert metadados do registro no Firestore (sem blobs). */
+/** Upsert metadados do registro no Firestore (sem blobs). Recusa se tombstoned. */
 export async function syncUpsertRecord(record) {
   if (!isSyncActive() || !record) return;
-  const { doc, setDoc } = await import('https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js');
+  if (!record.id || isTombstoned(record.id)) {
+    console.warn('syncUpsertRecord: recusado — id tombstoned', record?.id);
+    return { ok: false, reason: 'tombstoned' };
+  }
+  const { doc, setDoc, getDoc } = await import('https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js');
+  try {
+    const ex = await getDoc(doc(db, FIRESTORE_EXCLUIDOS, record.id));
+    if (ex.exists()) {
+      addTombstone(record.id);
+      console.warn('syncUpsertRecord: recusado — está em excluidos', record.id);
+      return { ok: false, reason: 'tombstoned' };
+    }
+  } catch (err) {
+    console.warn('syncUpsertRecord: check excluidos falhou', err);
+  }
   const payload = { ...record };
   delete payload._localOnly;
   await setDoc(doc(db, FIRESTORE_COLLECTION, record.id), payload, { merge: true });
+  return { ok: true };
 }
 
 async function deletePhotoDocDeep(recordId, photoId) {
@@ -118,6 +137,64 @@ export async function syncDeleteRecord(id) {
     console.warn('Falha ao apagar fotos remotas do registro:', err);
   }
   await deleteDoc(doc(db, FIRESTORE_COLLECTION, id));
+}
+
+/** Marca id como excluído na coleção excluidos/{id}. */
+export async function syncMarkExcluded(id) {
+  if (!isSyncActive() || !id) return;
+  const { doc, setDoc } = await import('https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js');
+  await setDoc(
+    doc(db, FIRESTORE_EXCLUIDOS, String(id)),
+    { deletedAt: new Date().toISOString() },
+    { merge: true }
+  );
+}
+
+/** Lista ids tombstoned remotos (coleção excluidos). */
+export async function syncPullExcludedIds() {
+  if (!isSyncActive()) return [];
+  const { collection, getDocs } = await import('https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js');
+  const snap = await getDocs(collection(db, FIRESTORE_EXCLUIDOS));
+  const ids = [];
+  snap.forEach((d) => ids.push(d.id));
+  return ids;
+}
+
+/**
+ * Escuta em tempo real a coleção excluidos.
+ * onChange(string[] ids) a cada snapshot; retorna unsubscribe.
+ */
+export function subscribeExcluded(onChange) {
+  if (!isSyncActive()) {
+    return () => {};
+  }
+  let unsub = () => {};
+  let cancelled = false;
+  (async () => {
+    try {
+      const { collection, onSnapshot } = await import(
+        'https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js'
+      );
+      if (cancelled) return;
+      unsub = onSnapshot(
+        collection(db, FIRESTORE_EXCLUIDOS),
+        (snap) => {
+          const ids = [];
+          snap.forEach((d) => ids.push(d.id));
+          onChange(ids);
+        },
+        (err) => {
+          console.warn('subscribeExcluded:', err);
+        }
+      );
+    } catch (err) {
+      console.warn('subscribeExcluded init:', err);
+    }
+  })();
+  return () => {
+    cancelled = true;
+    unsub();
+  };
 }
 
 export async function syncPullAll() {

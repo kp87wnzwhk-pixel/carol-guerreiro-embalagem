@@ -9,6 +9,7 @@ export const STORAGE_KEYS = {
   recordsMirror: 'cgi_pack_records_mirror_v1',
   autoBackups: 'cgi_pack_auto_backups_v1',
   lastSaveAt: 'cgi_pack_last_save_at_v1',
+  deleted: 'cgi_pack_deleted_v1',
   pinOverride: 'cgi_pack_pin',
   sessionUnlock: 'cgi_pack_unlocked',
   nickname: 'cgi_pack_nickname',
