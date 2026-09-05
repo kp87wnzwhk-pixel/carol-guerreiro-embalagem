@@ -317,19 +317,34 @@ legend {
 /* List */
 .list-section { margin-bottom: 80px; }
 
+.list-card {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
 .list-item {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
-  width: 100%;
+  flex: 1 1 auto;
+  min-width: 0;
   text-align: left;
   padding: 14px 16px;
-  margin-bottom: 10px;
   border: 2px solid var(--border);
   border-radius: 14px;
   background: #fff;
   min-height: var(--touch);
   box-shadow: 0 1px 4px rgba(0,0,0,0.04);
+}
+
+.list-edit-btn {
+  flex: 0 0 auto;
+  align-self: center;
+  min-width: 72px;
+  padding: 10px 14px;
+  white-space: nowrap;
 }
 
 .list-item strong { color: var(--magenta); font-size: 1.05rem; }
@@ -424,6 +439,24 @@ legend {
 }
 
 /* Detail */
+.detail-identity {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: 2px solid transparent;
+  border-radius: 12px;
+  background: transparent;
+  padding: 8px 10px;
+  margin: -8px -10px 4px;
+}
+
+.detail-identity:active,
+.detail-identity:focus-visible {
+  border-color: var(--pink-mid);
+  background: var(--pink-light);
+  outline: none;
+}
+
 .detail-name {
   margin: 0;
   font-size: 1.35rem;
@@ -431,10 +464,27 @@ legend {
 }
 
 .detail-phone {
-  margin: 4px 0 14px;
+  margin: 4px 0 0;
   font-size: 1.05rem;
   color: var(--text);
   font-weight: 600;
+}
+
+.detail-tap-hint {
+  display: inline-block;
+  margin-top: 6px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.edit-hint {
+  margin: 8px 0 14px;
+  font-size: 0.88rem;
+}
+
+#btn-edit-all {
+  margin-top: 4px;
 }
 
 .detail-dl {

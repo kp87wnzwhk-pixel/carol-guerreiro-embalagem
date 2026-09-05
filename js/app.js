@@ -305,12 +305,24 @@ function bindPin() {
 /* ---------- Home ---------- */
 function listItemHtml(r) {
   return `
-      <button type="button" class="list-item" data-id="${r.id}">
-        <strong>${escapeHtml(r.clientName || 'Sem nome')}</strong>
-        <span class="list-meta">${escapeHtml(r.phone || '')}</span>
-        <span class="list-meta">${escapeHtml(formatMeasures(r))} · ${escapeHtml(formatWeight(r.weightGrams))}</span>
-        <span class="list-meta muted">${escapeHtml(formatDateBR(r.createdAt))}</span>
-      </button>`;
+      <div class="list-card" data-id="${r.id}">
+        <button type="button" class="list-item" data-open-detail="${r.id}">
+          <strong>${escapeHtml(r.clientName || 'Sem nome')}</strong>
+          <span class="list-meta">${escapeHtml(r.phone || '')}</span>
+          <span class="list-meta">${escapeHtml(formatMeasures(r))} · ${escapeHtml(formatWeight(r.weightGrams))}</span>
+          <span class="list-meta muted">${escapeHtml(formatDateBR(r.createdAt))}</span>
+        </button>
+        <button type="button" class="btn btn-outline btn-sm list-edit-btn" data-edit-id="${r.id}" aria-label="Editar caixa">
+          Editar
+        </button>
+      </div>`;
+}
+
+function openEditForm(id) {
+  editingId = id;
+  pendingPhotoBlobs = [];
+  currentView = 'form';
+  render();
 }
 
 function filteredHomeRecords() {
@@ -453,11 +465,17 @@ function bindHome() {
 }
 
 function bindListClicks() {
-  $$('.list-item').forEach((btn) => {
+  $$('[data-open-detail]').forEach((btn) => {
     btn.addEventListener('click', () => {
-      detailId = btn.dataset.id;
+      detailId = btn.dataset.openDetail;
       currentView = 'detail';
       render();
+    });
+  });
+  $$('[data-edit-id]').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      openEditForm(btn.dataset.editId);
     });
   });
 }
@@ -757,8 +775,13 @@ function renderDetailShell() {
     <div class="screen detail-screen">
       ${headerHtml({ showBack: true, compact: true, title: 'Detalhe da caixa' })}
       <section class="card detail-card">
-        <h2 class="detail-name">${escapeHtml(r.clientName)}</h2>
-        <p class="detail-phone">${escapeHtml(r.phone)}</p>
+        <button type="button" class="detail-identity" id="btn-edit-identity" aria-label="Editar nome e telefone">
+          <h2 class="detail-name">${escapeHtml(r.clientName)}</h2>
+          <p class="detail-phone">${escapeHtml(r.phone)}</p>
+          <span class="detail-tap-hint">Toque para editar</span>
+        </button>
+        <button type="button" class="btn btn-primary btn-lg btn-block" id="btn-edit-all">Editar tudo</button>
+        <p class="hint edit-hint">Toque em Editar tudo para mudar nome, telefone, medidas, peso e fotos.</p>
         <dl class="detail-dl">
           <div><dt>Medidas</dt><dd>${escapeHtml(formatMeasures(r))}</dd></div>
           <div><dt>Peso</dt><dd>${escapeHtml(formatWeight(r.weightGrams))}</dd></div>
@@ -786,7 +809,6 @@ function renderDetailShell() {
         <div class="btn-row stacked">
           <a class="btn btn-whatsapp btn-lg btn-block" id="btn-wa" target="_blank" rel="noopener"
             href="${escapeAttr(waLink(r.phone, r.clientName))}">WhatsApp</a>
-          <button type="button" class="btn btn-primary btn-lg btn-block" id="btn-edit">Editar</button>
           <button type="button" class="btn btn-danger btn-lg btn-block" id="btn-delete">Excluir</button>
         </div>
       </section>
@@ -802,12 +824,9 @@ function bindDetail() {
   const r = getRecord(detailId);
   if (!r) return;
 
-  $('#btn-edit')?.addEventListener('click', () => {
-    editingId = r.id;
-    pendingPhotoBlobs = [];
-    currentView = 'form';
-    render();
-  });
+  const goEdit = () => openEditForm(r.id);
+  $('#btn-edit-all')?.addEventListener('click', goEdit);
+  $('#btn-edit-identity')?.addEventListener('click', goEdit);
 
   $('#btn-delete')?.addEventListener('click', async () => {
     if (!confirm(`Excluir a caixa de ${r.clientName}? Esta ação não pode ser desfeita.`)) return;

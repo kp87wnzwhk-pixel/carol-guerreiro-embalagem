@@ -137,7 +137,7 @@ Cada registro tem um campo `workDate` (`YYYY-MM-DD`, data local do aparelho) —
 3. Abra `https://<usuario>.github.io/<repo>/`
 4. No celular: **Adicionar à tela inicial** (PWA)
 
-O service worker usa cache `cgi-pack-v3` — após deploy, feche e reabra o PWA (ou limpe só o cache do SW) para receber a atualização.
+O service worker usa cache `cgi-pack-v4` — após deploy, feche e reabra o PWA (ou limpe só o cache do SW) para receber a atualização.
 
 ## Estrutura
 
@@ -151,7 +151,7 @@ js/db.js              ← IndexedDB fotos
 js/sync.js
 js/firebase-config.js ← SYNC_ENABLED + credenciais
 manifest.json
-sw.js                 ← cache cgi-pack-v3
+sw.js                 ← cache cgi-pack-v4
 icons/
 README.md
 ```

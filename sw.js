@@ -1,5 +1,5 @@
 /* Service worker — cache estático para uso offline */
-const CACHE = 'cgi-pack-v3';
+const CACHE = 'cgi-pack-v4';
 const ASSETS = [
   './',
   './index.html',
