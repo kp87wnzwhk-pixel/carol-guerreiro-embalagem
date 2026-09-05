@@ -4,7 +4,8 @@ App **estático** (PWA mobile-first) para registrar caixas embaladas no armazém
 
 **Slogan:** *No Brasil é luxo, com a Carol é barato.*
 
-- Lista de caixas com busca por nome/telefone
+- Lista de caixas agrupada por **data da caixa** (Hoje / Amanhã / outros dias) com busca por nome/telefone
+- Mover caixas entre dias (hoje, amanhã ou data escolhida)
 - Medidas (C × L × A em cm), peso (kg + g), fotos, observações
 - PIN da equipe (padrão temporário: **`2026`**)
 - Durabilidade local reforçada (espelho + auto-backups + download automático)
@@ -118,6 +119,17 @@ service firebase.storage {
 }
 ```
 
+
+## Datas das caixas (`workDate`)
+
+Cada registro tem um campo `workDate` (`YYYY-MM-DD`, data local do aparelho) — o **dia de embalagem** na lista.
+
+- Ao criar, o padrão é **hoje** (calendário local; ex. America/Sao_Paulo no aparelho)
+- Registros antigos sem o campo usam a data local de `createdAt`
+- A home agrupa por dia (Hoje e Amanhã no topo, depois datas mais recentes)
+- No detalhe: **Mover para hoje / amanhã / escolher data** (salva + auto-backup + toast)
+- Incluído no export/import JSON
+
 ## GitHub Pages
 
 1. Suba a pasta para um repositório GitHub
@@ -125,7 +137,7 @@ service firebase.storage {
 3. Abra `https://<usuario>.github.io/<repo>/`
 4. No celular: **Adicionar à tela inicial** (PWA)
 
-O service worker usa cache `cgi-pack-v2` — após deploy, feche e reabra o PWA (ou limpe só o cache do SW) para receber a atualização.
+O service worker usa cache `cgi-pack-v3` — após deploy, feche e reabra o PWA (ou limpe só o cache do SW) para receber a atualização.
 
 ## Estrutura
 
@@ -139,7 +151,7 @@ js/db.js              ← IndexedDB fotos
 js/sync.js
 js/firebase-config.js ← SYNC_ENABLED + credenciais
 manifest.json
-sw.js                 ← cache cgi-pack-v2
+sw.js                 ← cache cgi-pack-v3
 icons/
 README.md
 ```

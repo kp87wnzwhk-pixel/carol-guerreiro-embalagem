@@ -583,3 +583,59 @@ legend {
 
 .toast.ok { background: #1b5e20; }
 .toast.err { background: var(--red); }
+
+
+/* Day grouping (home) */
+.day-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.day-chip {
+  min-height: 36px;
+  padding: 6px 14px;
+  border-radius: 999px;
+  border: 2px solid var(--border);
+  background: #fff;
+  color: var(--magenta);
+  font-weight: 700;
+  font-size: 0.85rem;
+}
+
+.day-chip.active {
+  background: linear-gradient(135deg, var(--pink), var(--magenta));
+  color: #fff;
+  border-color: transparent;
+}
+
+.day-section {
+  margin-bottom: 18px;
+}
+
+.day-section-title {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 4px 0 10px;
+  font-size: 0.95rem;
+  font-weight: 800;
+  color: var(--magenta);
+}
+
+.day-count {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.move-day-block {
+  margin: 16px 0;
+  padding: 14px;
+  border-radius: 12px;
+  background: var(--pink-light);
+  border: 1px solid var(--border);
+}

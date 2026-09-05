@@ -64,6 +64,121 @@ export function formatMeasures(r) {
   return parts.join(' × ') + ' cm';
 }
 
+/** Data local do aparelho no formato YYYY-MM-DD. */
+export function localDateISO(date = new Date()) {
+  const d = date instanceof Date ? date : new Date(date);
+  if (Number.isNaN(d.getTime())) return localDateISO(new Date());
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+export function todayLocalISO() {
+  return localDateISO(new Date());
+}
+
+export function tomorrowLocalISO() {
+  const d = new Date();
+  d.setDate(d.getDate() + 1);
+  return localDateISO(d);
+}
+
+/** Valida string YYYY-MM-DD; retorna a própria string ou null. */
+export function parseWorkDate(value) {
+  const s = String(value || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
+  const [y, m, day] = s.split('-').map(Number);
+  const d = new Date(y, m - 1, day);
+  if (d.getFullYear() !== y || d.getMonth() !== m - 1 || d.getDate() !== day) return null;
+  return s;
+}
+
+/** Deriva workDate de createdAt (data local do aparelho). */
+export function workDateFromCreatedAt(iso) {
+  try {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return todayLocalISO();
+    return localDateISO(d);
+  } catch {
+    return todayLocalISO();
+  }
+}
+
+/** Formata YYYY-MM-DD → DD/MM/AAAA */
+export function formatWorkDateBR(workDate) {
+  const s = parseWorkDate(workDate);
+  if (!s) return '—';
+  const [y, m, day] = s.split('-');
+  return `${day}/${m}/${y}`;
+}
+
+const WEEKDAYS_PT = [
+  'Domingo',
+  'Segunda',
+  'Terça',
+  'Quarta',
+  'Quinta',
+  'Sexta',
+  'Sábado',
+];
+
+/**
+ * Título de secção na home:
+ * - hoje → "Hoje · DD/MM/AAAA"
+ * - amanhã → "Amanhã · DD/MM/AAAA"
+ * - else → "Segunda · DD/MM/AAAA"
+ */
+export function formatWorkDateSectionTitle(workDate) {
+  const s = parseWorkDate(workDate);
+  if (!s) return '—';
+  const br = formatWorkDateBR(s);
+  const today = todayLocalISO();
+  const tomorrow = tomorrowLocalISO();
+  if (s === today) return `Hoje · ${br}`;
+  if (s === tomorrow) return `Amanhã · ${br}`;
+  const [y, m, day] = s.split('-').map(Number);
+  const d = new Date(y, m - 1, day);
+  const wd = WEEKDAYS_PT[d.getDay()] || '';
+  return `${wd} · ${br}`;
+}
+
+/**
+ * Agrupa registros por workDate.
+ * Ordem: Hoje, Amanhã (se houver), depois outras datas descendentes.
+ * @returns {{ workDate: string, title: string, records: object[] }[]}
+ */
+export function groupRecordsByWorkDate(records) {
+  const map = new Map();
+  for (const r of records || []) {
+    const wd = parseWorkDate(r.workDate) || workDateFromCreatedAt(r.createdAt);
+    if (!map.has(wd)) map.set(wd, []);
+    map.get(wd).push(r);
+  }
+  for (const list of map.values()) {
+    list.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+  }
+  const today = todayLocalISO();
+  const tomorrow = tomorrowLocalISO();
+  const keys = [...map.keys()].sort((a, b) => b.localeCompare(a)); // newest first
+  const ordered = [];
+  const used = new Set();
+  if (map.has(today)) {
+    ordered.push(today);
+    used.add(today);
+  }
+  if (map.has(tomorrow)) {
+    ordered.push(tomorrow);
+    used.add(tomorrow);
+  }
+  for (const k of keys) {
+    if (!used.has(k)) ordered.push(k);
+  }
+  return ordered.map((workDate) => ({
+    workDate,
+    title: formatWorkDateSectionTitle(workDate),
+    records: map.get(workDate),
+  }));
+}
+
 export function normalizeRecord(raw) {
   if (!raw || typeof raw !== 'object') return null;
   const id = String(raw.id || crypto.randomUUID());
@@ -73,6 +188,11 @@ export function normalizeRecord(raw) {
   }
   weightGrams = Math.max(0, Math.floor(Number(weightGrams) || 0));
   const now = new Date().toISOString();
+  const createdAt = raw.createdAt || now;
+  let workDate = parseWorkDate(raw.workDate);
+  if (!workDate) {
+    workDate = workDateFromCreatedAt(createdAt);
+  }
   return {
     id,
     clientName: String(raw.clientName || '').trim(),
@@ -83,7 +203,8 @@ export function normalizeRecord(raw) {
     weightGrams,
     notes: String(raw.notes || '').trim(),
     createdBy: String(raw.createdBy || '').trim(),
-    createdAt: raw.createdAt || now,
+    workDate,
+    createdAt,
     updatedAt: raw.updatedAt || now,
     photoCount: Number(raw.photoCount) || 0,
   };

@@ -30,6 +30,12 @@ import {
   peekRecoveryBanner,
   clearRecoveryBanner,
   backupFilename,
+  todayLocalISO,
+  tomorrowLocalISO,
+  parseWorkDate,
+  formatWorkDateBR,
+  formatWorkDateSectionTitle,
+  groupRecordsByWorkDate,
 } from './storage.js';
 import {
   addPhoto,
@@ -58,6 +64,7 @@ let currentView = 'pin'; // pin | home | form | detail | settings | backup
 let editingId = null;
 let detailId = null;
 let searchQuery = '';
+let dayFilter = 'all'; // 'all' | 'today' | 'tomorrow' — chips na home
 let recoveryBanner = null; // one-time after boot recovery
 
 const $ = (sel, el = document) => el.querySelector(sel);
@@ -296,19 +303,57 @@ function bindPin() {
 }
 
 /* ---------- Home ---------- */
-function renderHome() {
-  const list = searchRecords(records, searchQuery);
-  const sync = getSyncStatus();
-  const items = list.length
-    ? list.map((r) => `
+function listItemHtml(r) {
+  return `
       <button type="button" class="list-item" data-id="${r.id}">
         <strong>${escapeHtml(r.clientName || 'Sem nome')}</strong>
         <span class="list-meta">${escapeHtml(r.phone || '')}</span>
         <span class="list-meta">${escapeHtml(formatMeasures(r))} · ${escapeHtml(formatWeight(r.weightGrams))}</span>
         <span class="list-meta muted">${escapeHtml(formatDateBR(r.createdAt))}</span>
-      </button>
-    `).join('')
-    : `<p class="empty-state">${searchQuery ? 'Nenhuma caixa encontrada.' : 'Nenhuma caixa embalada ainda. Toque em “Nova caixa”.'}</p>`;
+      </button>`;
+}
+
+function filteredHomeRecords() {
+  let list = searchRecords(records, searchQuery);
+  if (dayFilter === 'today') {
+    const t = todayLocalISO();
+    list = list.filter((r) => r.workDate === t);
+  } else if (dayFilter === 'tomorrow') {
+    const t = tomorrowLocalISO();
+    list = list.filter((r) => r.workDate === t);
+  }
+  return list;
+}
+
+function renderGroupedListHtml(list) {
+  if (!list.length) {
+    return `<p class="empty-state">${
+      searchQuery || dayFilter !== 'all'
+        ? 'Nenhuma caixa encontrada.'
+        : 'Nenhuma caixa embalada ainda. Toque em “Nova caixa”.'
+    }</p>`;
+  }
+  const groups = groupRecordsByWorkDate(list);
+  return groups
+    .map((g) => {
+      const count = g.records.length;
+      const countLabel = `${count} caixa${count === 1 ? '' : 's'}`;
+      return `
+      <section class="day-section" data-work-date="${escapeAttr(g.workDate)}" id="day-${escapeAttr(g.workDate)}">
+        <h2 class="day-section-title">
+          <span>${escapeHtml(g.title)}</span>
+          <span class="day-count">${escapeHtml(countLabel)}</span>
+        </h2>
+        ${g.records.map(listItemHtml).join('')}
+      </section>`;
+    })
+    .join('');
+}
+
+function renderHome() {
+  const list = filteredHomeRecords();
+  const sync = getSyncStatus();
+  const items = renderGroupedListHtml(list);
 
   const banner = recoveryBanner
     ? `<div class="recovery-banner" role="status" id="recovery-banner">
@@ -316,6 +361,9 @@ function renderHome() {
         <button type="button" class="banner-dismiss" id="btn-dismiss-recovery" aria-label="Fechar">✕</button>
       </div>`
     : '';
+
+  const chip = (id, label) =>
+    `<button type="button" class="day-chip${dayFilter === id ? ' active' : ''}" data-day-filter="${id}">${label}</button>`;
 
   return `
     <div class="screen home-screen">
@@ -330,6 +378,11 @@ function renderHome() {
         <label for="search-input" class="card-title">Buscar — nome ou telefone</label>
         <input type="search" id="search-input" placeholder="Ex: Maria, (21) 9…"
           value="${escapeAttr(searchQuery)}" autocomplete="off" />
+        <div class="day-chips" role="group" aria-label="Filtrar por dia">
+          ${chip('today', 'Hoje')}
+          ${chip('tomorrow', 'Amanhã')}
+          ${chip('all', 'Todas')}
+        </div>
       </section>
       <section class="list-section" id="record-list" aria-live="polite">
         ${items}
@@ -342,6 +395,13 @@ function renderHome() {
       </footer>
     </div>
   `;
+}
+
+function refreshHomeList() {
+  const host = $('#record-list');
+  if (!host) return;
+  host.innerHTML = renderGroupedListHtml(filteredHomeRecords());
+  bindListClicks();
 }
 
 function bindHome() {
@@ -369,23 +429,25 @@ function bindHome() {
   if (recoveryBanner) {
     clearRecoveryBanner();
   }
+  $$('[data-day-filter]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      dayFilter = btn.dataset.dayFilter || 'all';
+      $$('[data-day-filter]').forEach((b) => {
+        b.classList.toggle('active', b.dataset.dayFilter === dayFilter);
+      });
+      refreshHomeList();
+      if (dayFilter === 'today' || dayFilter === 'tomorrow') {
+        const target =
+          dayFilter === 'today' ? todayLocalISO() : tomorrowLocalISO();
+        const el = document.getElementById(`day-${target}`);
+        el?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
+    });
+  });
   const search = $('#search-input');
   search?.addEventListener('input', () => {
     searchQuery = search.value;
-    const list = searchRecords(records, searchQuery);
-    const host = $('#record-list');
-    if (!host) return;
-    host.innerHTML = list.length
-      ? list.map((r) => `
-        <button type="button" class="list-item" data-id="${r.id}">
-          <strong>${escapeHtml(r.clientName || 'Sem nome')}</strong>
-          <span class="list-meta">${escapeHtml(r.phone || '')}</span>
-          <span class="list-meta">${escapeHtml(formatMeasures(r))} · ${escapeHtml(formatWeight(r.weightGrams))}</span>
-          <span class="list-meta muted">${escapeHtml(formatDateBR(r.createdAt))}</span>
-        </button>
-      `).join('')
-      : `<p class="empty-state">${searchQuery ? 'Nenhuma caixa encontrada.' : 'Nenhuma caixa embalada ainda.'}</p>`;
-    bindListClicks();
+    refreshHomeList();
   });
   bindListClicks();
 }
@@ -418,6 +480,11 @@ function renderForm() {
           <label for="f-phone">Telefone <span class="required">*</span></label>
           <input type="tel" id="f-phone" inputmode="tel" required autocomplete="tel"
             placeholder="(21) 99999-0000" value="${escapeAttr(r?.phone || '')}" />
+        </div>
+        <div class="form-row">
+          <label for="f-work-date">Data da caixa</label>
+          <input type="date" id="f-work-date" required
+            value="${escapeAttr(r?.workDate || todayLocalISO())}" />
         </div>
         <fieldset class="measure-fieldset">
           <legend>Medidas da caixa (cm)</legend>
@@ -609,6 +676,8 @@ async function saveForm() {
   const notes = ($('#f-notes')?.value || '').trim();
   const createdBy = ($('#f-by')?.value || '').trim();
   setSavedNickname(createdBy);
+  const workDate =
+    parseWorkDate($('#f-work-date')?.value) || todayLocalISO();
 
   const now = new Date().toISOString();
   let rec;
@@ -624,6 +693,7 @@ async function saveForm() {
       weightGrams: weightToGrams(kg, g),
       notes,
       createdBy,
+      workDate: workDate,
       updatedAt: now,
     });
     records = records.map((r) => (r.id === editingId ? rec : r));
@@ -638,6 +708,7 @@ async function saveForm() {
       weightGrams: weightToGrams(kg, g),
       notes,
       createdBy,
+      workDate: workDate,
       createdAt: now,
       updatedAt: now,
     });
@@ -691,12 +762,27 @@ function renderDetailShell() {
         <dl class="detail-dl">
           <div><dt>Medidas</dt><dd>${escapeHtml(formatMeasures(r))}</dd></div>
           <div><dt>Peso</dt><dd>${escapeHtml(formatWeight(r.weightGrams))}</dd></div>
+          <div><dt>Data da caixa</dt><dd>${escapeHtml(formatWorkDateSectionTitle(r.workDate))}</dd></div>
           <div><dt>Criado em</dt><dd>${escapeHtml(formatDateBR(r.createdAt))}</dd></div>
           <div><dt>Atualizado</dt><dd>${escapeHtml(formatDateBR(r.updatedAt))}</dd></div>
           ${r.createdBy ? `<div><dt>Por</dt><dd>${escapeHtml(r.createdBy)}</dd></div>` : ''}
           ${r.notes ? `<div class="full"><dt>Observações</dt><dd>${escapeHtml(r.notes)}</dd></div>` : ''}
         </dl>
         <div class="photo-gallery" id="detail-photos"><p class="hint">Carregando fotos…</p></div>
+        <div class="move-day-block">
+          <p class="card-title" style="margin-bottom:8px">Mover para outro dia</p>
+          <div class="btn-row">
+            <button type="button" class="btn btn-outline btn-sm" id="btn-move-today">Mover para hoje</button>
+            <button type="button" class="btn btn-outline btn-sm" id="btn-move-tomorrow">Mover para amanhã</button>
+          </div>
+          <div class="form-row" style="margin-top:10px;margin-bottom:0">
+            <label for="f-move-date">Escolher outra data…</label>
+            <input type="date" id="f-move-date" value="${escapeAttr(r.workDate || todayLocalISO())}" />
+          </div>
+          <button type="button" class="btn btn-secondary btn-sm btn-block" id="btn-move-custom" style="margin-top:8px">
+            Aplicar data escolhida
+          </button>
+        </div>
         <div class="btn-row stacked">
           <a class="btn btn-whatsapp btn-lg btn-block" id="btn-wa" target="_blank" rel="noopener"
             href="${escapeAttr(waLink(r.phone, r.clientName))}">WhatsApp</a>
@@ -737,7 +823,51 @@ function bindDetail() {
     render();
   });
 
+  $('#btn-move-today')?.addEventListener('click', () => moveRecordToDate(r.id, todayLocalISO()));
+  $('#btn-move-tomorrow')?.addEventListener('click', () =>
+    moveRecordToDate(r.id, tomorrowLocalISO())
+  );
+  $('#btn-move-custom')?.addEventListener('click', () => {
+    const picked = parseWorkDate($('#f-move-date')?.value);
+    if (!picked) {
+      toast('Data inválida', 'err');
+      return;
+    }
+    moveRecordToDate(r.id, picked);
+  });
+
   loadDetailPhotos(r.id);
+}
+
+async function moveRecordToDate(id, workDate) {
+  const existing = getRecord(id);
+  if (!existing) return;
+  const target = parseWorkDate(workDate);
+  if (!target) {
+    toast('Data inválida', 'err');
+    return;
+  }
+  if (existing.workDate === target) {
+    toast(`Já está em ${formatWorkDateSectionTitle(target)}`);
+    return;
+  }
+  const now = new Date().toISOString();
+  const rec = normalizeRecord({
+    ...existing,
+    workDate: target,
+    updatedAt: now,
+  });
+  records = records.map((x) => (x.id === id ? rec : x));
+  persistLocal();
+  try {
+    if (isSyncActive()) await syncUpsertRecord(rec);
+  } catch (e) {
+    console.warn('Sync upsert:', e);
+  }
+  afterSuccessfulSave();
+  detailId = id;
+  currentView = 'detail';
+  render();
 }
 
 async function loadDetailPhotos(recordId) {
