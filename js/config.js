@@ -14,6 +14,7 @@ export const STORAGE_KEYS = {
   sessionUnlock: 'cgi_pack_unlocked',
   nickname: 'cgi_pack_nickname',
   recoveryBanner: 'cgi_pack_recovery_banner',
+  trackingTpl: 'cgi_pack_tracking_tpl_v1',
 };
 
 export const AUTO_BACKUP_MAX = 30;

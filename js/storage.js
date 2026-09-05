@@ -19,18 +19,66 @@ export function formatPhoneBR(value) {
   return `(${d.slice(0, 2)}) ${d.slice(2, 7)}-${d.slice(7)}`;
 }
 
-export function waLink(phone, name) {
+export function waDigitsIntl(phone) {
   let d = phoneDigits(phone);
   if (d.startsWith('55') && d.length >= 12) {
     /* already with country */
   } else if (d.length >= 10 && d.length <= 11) {
     d = '55' + d;
   }
+  return d;
+}
+
+export function waLink(phone, name) {
+  const d = waDigitsIntl(phone);
   const text = encodeURIComponent(
     `Olá ${name || ''}, aqui é da Carol Guerreiro Importado.`
   );
   return `https://wa.me/${d}?text=${text}`;
 }
+
+/** Link WhatsApp com texto livre (ex.: código de rastreio). */
+export function waLinkText(phone, message) {
+  const d = waDigitsIntl(phone);
+  return `https://wa.me/${d}?text=${encodeURIComponent(String(message || ''))}`;
+}
+
+/** Mensagem padrão de rastreio FedEx; {{CODIGO}} vira o código. */
+export const TRACKING_MSG_DEFAULT = `Olá, segue o código de rastreio:
+
+{{CODIGO}}
+
+Acompanhe sua caixa no site!
+https://www.fedex.com/pt-br/home.html
+
+atendimento tel. 3003-3339 (regiões metropolitanas) ou 0800-703-3339 (demais regiões).`;
+
+export function buildTrackingMessage(code, template) {
+  const tpl = String(template || TRACKING_MSG_DEFAULT);
+  const c = String(code || '').trim() || '________';
+  if (tpl.includes('{{CODIGO}}')) return tpl.split('{{CODIGO}}').join(c);
+  return tpl;
+}
+
+export function getTrackingTemplate() {
+  try {
+    const t = localStorage.getItem(STORAGE_KEYS.trackingTpl);
+    if (t && t.trim()) return t;
+  } catch (_) {}
+  return TRACKING_MSG_DEFAULT;
+}
+
+export function setTrackingTemplate(text) {
+  try {
+    const t = String(text || '').trim();
+    if (!t || t === TRACKING_MSG_DEFAULT) {
+      localStorage.removeItem(STORAGE_KEYS.trackingTpl);
+    } else {
+      localStorage.setItem(STORAGE_KEYS.trackingTpl, t.includes('{{CODIGO}}') ? t : t);
+    }
+  } catch (_) {}
+}
+
 
 /** Peso total em gramas a partir de kg + g */
 export function weightToGrams(kg, g) {
@@ -203,6 +251,8 @@ export function normalizeRecord(raw) {
     weightGrams,
     notes: String(raw.notes || '').trim(),
     createdBy: String(raw.createdBy || '').trim(),
+    trackingCode: String(raw.trackingCode || '').trim(),
+    trackingMessage: String(raw.trackingMessage || '').trim(),
     workDate,
     createdAt,
     updatedAt: raw.updatedAt || now,

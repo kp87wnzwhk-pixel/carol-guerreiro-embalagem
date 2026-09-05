@@ -1,5 +1,5 @@
 /* Service worker v19 — pass-through, sem precache */
-const CACHE = 'cgi-pack-v19';
+const CACHE = 'cgi-pack-v20';
 self.addEventListener('install', (e) => e.waitUntil(self.skipWaiting()));
 self.addEventListener('activate', (e) => {
   e.waitUntil(

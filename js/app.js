@@ -9,6 +9,11 @@ import {
   formatPhoneBR,
   phoneDigits,
   waLink,
+  waLinkText,
+  buildTrackingMessage,
+  getTrackingTemplate,
+  setTrackingTemplate,
+  TRACKING_MSG_DEFAULT,
   weightToGrams,
   gramsToKgG,
   formatWeight,
@@ -76,7 +81,7 @@ let NAME_SCORE_MIN = 0.35;
 
 async function ensureOcr() {
   if (recognizeLabel) return;
-  const mod = await import('./ocr-fill.js?v=19');
+  const mod = await import('./ocr-fill.js?v=20');
   recognizeLabel = mod.recognize;
   parseMeasures = mod.parseMeasures;
   parseWeight = mod.parseWeight;
@@ -757,7 +762,11 @@ function listItemHtml(r) {
       <div class="list-card" data-id="${r.id}">
         <button type="button" class="list-item" data-open-detail="${r.id}">
           <strong>${escapeHtml(r.clientName || 'Sem nome')}</strong>
-          <span class="list-meta">${escapeHtml(r.phone || '')}</span>
+          <span class="list-meta">${escapeHtml(r.phone || '')}${
+            r.trackingCode
+              ? ` · <span class="list-tracking">Rastreio ${escapeHtml(r.trackingCode)}</span>`
+              : ''
+          }</span>
           <span class="list-meta">${escapeHtml(formatMeasures(r))} · ${escapeHtml(formatWeight(r.weightGrams))}</span>
           <span class="list-meta muted">${escapeHtml(formatDateBR(r.createdAt))}</span>
         </button>
@@ -1747,9 +1756,31 @@ function renderDetailShell() {
             Aplicar data escolhida
           </button>
         </div>
-        <div class="btn-row stacked">
-          <a class="btn btn-whatsapp btn-lg btn-block" id="btn-wa" target="_blank" rel="noopener"
-            href="${escapeAttr(waLink(r.phone, r.clientName))}">WhatsApp</a>
+        <div class="tracking-block card-inset">
+          <p class="card-title" style="margin-bottom:8px">Código de rastreio</p>
+          <div class="form-row" style="margin-bottom:10px">
+            <label for="f-tracking">Código FedEx / rastreio</label>
+            <input type="text" id="f-tracking" inputmode="text" autocomplete="off"
+              placeholder="Ex.: 876145159227" value="${escapeAttr(r.trackingCode || '')}" />
+          </div>
+          <div class="form-row" style="margin-bottom:8px">
+            <label for="f-tracking-msg">Mensagem do WhatsApp <span class="hint">(editável)</span></label>
+            <textarea id="f-tracking-msg" rows="8" style="width:100%;min-height:140px;font-size:0.95rem;line-height:1.35">${escapeHtml(
+              r.trackingMessage || buildTrackingMessage(r.trackingCode || '', getTrackingTemplate())
+            )}</textarea>
+          </div>
+          <div class="btn-row" style="margin-bottom:8px;gap:8px;flex-wrap:wrap">
+            <button type="button" class="btn btn-outline btn-sm" id="btn-tracking-reset">Restaurar mensagem padrão</button>
+            <button type="button" class="btn btn-secondary btn-sm" id="btn-tracking-save">Salvar código</button>
+          </div>
+          <a class="btn btn-whatsapp btn-lg btn-block" id="btn-wa-tracking" target="_blank" rel="noopener">
+            Enviar rastreio no WhatsApp
+          </a>
+          <p class="hint" style="margin-top:8px">O código digitado entra sozinho na mensagem. Você pode editar o texto antes de enviar.</p>
+        </div>
+        <div class="btn-row stacked" style="margin-top:12px">
+          <a class="btn btn-outline btn-lg btn-block" id="btn-wa" target="_blank" rel="noopener"
+            href="${escapeAttr(waLink(r.phone, r.clientName))}">WhatsApp (olá)</a>
         </div>
         <div class="detail-delete-block" style="margin-top:20px;padding-top:16px;border-top:1px solid var(--border, #e5e5e5)">
           <button type="button" class="btn btn-danger btn-lg btn-block" id="btn-delete">Excluir contato</button>
@@ -1791,7 +1822,120 @@ function bindDetail() {
 
   $('#btn-reenviar-fotos')?.addEventListener('click', () => reenviarFotosParaNuvem(r.id));
 
+  bindTrackingBlock(r);
+
   loadDetailPhotos(r.id);
+}
+
+function bindTrackingBlock(r) {
+  const codeEl = $('#f-tracking');
+  const msgEl = $('#f-tracking-msg');
+  const btnSend = $('#btn-wa-tracking');
+  if (!codeEl || !msgEl || !btnSend) return;
+
+  let msgTouched = !!(r.trackingMessage && r.trackingMessage.trim());
+  let lastCode = String(r.trackingCode || '').trim();
+
+  const refreshSendHref = () => {
+    const msg = (msgEl.value || '').trim();
+    const code = (codeEl.value || '').trim();
+    if (!code) {
+      btnSend.removeAttribute('href');
+      btnSend.classList.add('is-disabled');
+      btnSend.setAttribute('aria-disabled', 'true');
+      btnSend.onclick = (e) => {
+        e.preventDefault();
+        toast('Digite o código de rastreio primeiro', 'err');
+      };
+      return;
+    }
+    btnSend.classList.remove('is-disabled');
+    btnSend.removeAttribute('aria-disabled');
+    btnSend.onclick = null;
+    btnSend.href = waLinkText(r.phone, msg || buildTrackingMessage(code, getTrackingTemplate()));
+  };
+
+  const injectCodeIntoMsg = () => {
+    const code = (codeEl.value || '').trim();
+    if (!msgTouched) {
+      msgEl.value = buildTrackingMessage(code, getTrackingTemplate());
+    } else if (lastCode && msgEl.value.includes(lastCode) && code && code !== lastCode) {
+      msgEl.value = msgEl.value.split(lastCode).join(code);
+    } else if (!msgTouched) {
+      msgEl.value = buildTrackingMessage(code, getTrackingTemplate());
+    } else if (code && !msgEl.value.includes(code) && msgEl.value.includes('________')) {
+      msgEl.value = msgEl.value.split('________').join(code);
+    }
+    lastCode = code;
+    refreshSendHref();
+  };
+
+  codeEl.addEventListener('input', () => {
+    injectCodeIntoMsg();
+  });
+
+  msgEl.addEventListener('input', () => {
+    msgTouched = true;
+    refreshSendHref();
+  });
+
+  $('#btn-tracking-reset')?.addEventListener('click', () => {
+    msgTouched = false;
+    const code = (codeEl.value || '').trim();
+    msgEl.value = buildTrackingMessage(code, TRACKING_MSG_DEFAULT);
+    setTrackingTemplate(TRACKING_MSG_DEFAULT);
+    lastCode = code;
+    refreshSendHref();
+    toast('Mensagem padrão restaurada');
+  });
+
+  $('#btn-tracking-save')?.addEventListener('click', async () => {
+    await saveTrackingForRecord(r.id, codeEl.value, msgEl.value, msgTouched);
+  });
+
+  btnSend.addEventListener('click', async (e) => {
+    e.preventDefault();
+    const code = (codeEl.value || '').trim();
+    if (!code) {
+      toast('Digite o código de rastreio primeiro', 'err');
+      return;
+    }
+    await saveTrackingForRecord(r.id, codeEl.value, msgEl.value, msgTouched);
+    const msg = (msgEl.value || '').trim() || buildTrackingMessage(code, getTrackingTemplate());
+    const url = waLinkText(r.phone, msg);
+    window.open(url, '_blank', 'noopener');
+  });
+
+  refreshSendHref();
+}
+
+async function saveTrackingForRecord(id, codeRaw, msgRaw, saveCustomMsg) {
+  const existing = getRecord(id);
+  if (!existing) return;
+  const trackingCode = String(codeRaw || '').trim();
+  const trackingMessage = saveCustomMsg ? String(msgRaw || '').trim() : '';
+  if (saveCustomMsg && trackingMessage) {
+    let tpl = trackingMessage;
+    if (trackingCode && tpl.includes(trackingCode)) {
+      tpl = tpl.split(trackingCode).join('{{CODIGO}}');
+    }
+    setTrackingTemplate(tpl.includes('{{CODIGO}}') ? tpl : trackingMessage);
+  }
+  const now = new Date().toISOString();
+  const rec = normalizeRecord({
+    ...existing,
+    trackingCode,
+    trackingMessage: trackingMessage || '',
+    updatedAt: now,
+  });
+  records = records.map((x) => (x.id === id ? rec : x));
+  persistLocal();
+  try {
+    if (isSyncActive() && !isTombstoned(rec.id)) await syncUpsertRecord(rec);
+  } catch (e) {
+    console.warn('Sync tracking:', e);
+  }
+  toast(trackingCode ? 'Código de rastreio salvo' : 'Rastreio limpo');
 }
 
 async function moveRecordToDate(id, workDate) {
